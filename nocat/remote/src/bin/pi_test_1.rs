@@ -54,12 +54,8 @@ async fn logger_task(driver: Driver<'static, USB>) {
 
 /// Events that worker tasks send to the orchestrator
 enum Events {
-    VsysVoltage(f32),      // New voltage reading
-    FirstRandomSeed(u32),  // Random number from 30s timer
-    SecondRandomSeed(u32), // Random number from 60s timer
-    ThirdRandomSeed(u32),  // Random number from 90s timer
-    ResetFirstRandomSeed,  // Signal to reset the first counter
-    KeyPressed(u8, bool),  // Key index, pressed state
+    VsysVoltage(f32),     // New voltage reading
+    KeyPressed(u8, bool), // Key index, pressed state
 }
 
 /// Commands that can control task behavior.
@@ -136,9 +132,6 @@ async fn main(spawner: Spawner) {
 
     // Spawn orchestrator tasks
     spawner.spawn(orchestrate(spawner).unwrap());
-    spawner.spawn(random_60s(spawner).unwrap());
-    spawner.spawn(random_90s(spawner).unwrap());
-    // `random_30s` is not spawned here, but in the orchestrate task depending on state
     spawner.spawn(vsys_voltage(spawner, r.vsys).unwrap());
     spawner.spawn(consumer(spawner).unwrap());
 
@@ -208,7 +201,7 @@ async fn keyboard_scanner(_spawner: Spawner, r: Keyboard) {
 
 /// Main task that processes all events and updates system state.
 #[embassy_executor::task]
-async fn orchestrate(spawner: Spawner) {
+async fn orchestrate(_spawner: Spawner) {
     let receiver = EVENT_CHANNEL.receiver();
     log::info!("Starting up.");
 
@@ -225,28 +218,6 @@ async fn orchestrate(spawner: Spawner) {
                     state.vsys_voltage = voltage;
                     log::info!("Vsys voltage: {}", voltage);
                 }
-                Events::FirstRandomSeed(seed) => {
-                    state.first_random_seed = seed;
-                    state.times_we_got_first_random_seed += 1;
-                    log::info!(
-                        "First random seed: {}, and that was iteration {} of receiving this.",
-                        seed,
-                        &state.times_we_got_first_random_seed
-                    );
-                }
-                Events::SecondRandomSeed(seed) => {
-                    state.second_random_seed = seed;
-                    log::info!("Second random seed: {}", seed);
-                }
-                Events::ThirdRandomSeed(seed) => {
-                    state.third_random_seed = seed;
-                    log::info!("Third random seed: {}", seed);
-                }
-                Events::ResetFirstRandomSeed => {
-                    state.times_we_got_first_random_seed = 0;
-                    state.first_random_seed = 0;
-                    log::info!("Resetting the first random seed counter");
-                }
                 Events::KeyPressed(key, pressed) => {
                     log::info!("Key {} {}", key, if pressed { "pressed" } else { "released" });
                     match key {
@@ -255,26 +226,6 @@ async fn orchestrate(spawner: Spawner) {
                         _ => {}
                     }
                 }
-            }
-
-            // Handle task orchestration based on state
-            // Just placed as an example here, could be hooked into the event system, put on a timer, ...
-            match state.times_we_got_first_random_seed {
-                max if max == state.maximum_times_we_want_first_random_seed => {
-                    log::info!("Stopping the first random signal task");
-                    STOP_FIRST_RANDOM_SIGNAL.signal(Commands::Stop);
-                    EVENT_CHANNEL.sender().send(Events::ResetFirstRandomSeed).await;
-                }
-                0 => {
-                    let respawn_first_random_seed_task = !state.first_random_seed_task_running;
-                    // Deliberately dropping the Mutex lock here to release it before a lengthy operation
-                    drop(state);
-                    if respawn_first_random_seed_task {
-                        log::info!("(Re)-Starting the first random signal task");
-                        spawner.spawn(random_30s(spawner).unwrap());
-                    }
-                }
-                _ => {}
             }
         }
 
@@ -291,76 +242,11 @@ async fn consumer(_spawner: Spawner) {
 
         let state = SYSTEM_STATE.lock().await;
         log::info!(
-            "State update - {:?} | Seeds - First: {} (count: {}/{}, running: {}), Second: {}, Third: {} | Keys: {} {}",
+            "State update - {:?} | Keys: {} {}",
             state.get_system_summary(),
-            state.first_random_seed,
-            state.times_we_got_first_random_seed,
-            state.maximum_times_we_want_first_random_seed,
-            state.first_random_seed_task_running,
-            state.second_random_seed,
-            state.third_random_seed,
             state.key0_pressed,
             state.key1_pressed
         );
-    }
-}
-
-/// Task that generates random numbers every 30 seconds until stopped.
-/// Shows how to handle both timer events and stop signals.
-/// As an example of some routine we want to be on or off depending on other needs.
-#[embassy_executor::task]
-async fn random_30s(_spawner: Spawner) {
-    {
-        let mut state = SYSTEM_STATE.lock().await;
-        state.first_random_seed_task_running = true;
-    }
-
-    let mut rng = RoscRng;
-    let sender = EVENT_CHANNEL.sender();
-
-    loop {
-        // Wait for either 30s timer or stop signal (like select() in Go)
-        match select(Timer::after(Duration::from_secs(30)), STOP_FIRST_RANDOM_SIGNAL.wait()).await {
-            Either::First(_) => {
-                log::info!("30s are up, generating random number");
-                let random_number = rng.next_u32();
-                sender.send(Events::FirstRandomSeed(random_number)).await;
-            }
-            Either::Second(_) => {
-                log::info!("Received signal to stop, goodbye!");
-
-                let mut state = SYSTEM_STATE.lock().await;
-                state.first_random_seed_task_running = false;
-
-                break;
-            }
-        }
-    }
-}
-
-/// Task that generates random numbers every 60 seconds. As an example of some routine.
-#[embassy_executor::task]
-async fn random_60s(_spawner: Spawner) {
-    let mut rng = RoscRng;
-    let sender = EVENT_CHANNEL.sender();
-
-    loop {
-        Timer::after(Duration::from_secs(60)).await;
-        let random_number = rng.next_u32();
-        sender.send(Events::SecondRandomSeed(random_number)).await;
-    }
-}
-
-/// Task that generates random numbers every 90 seconds. . As an example of some routine.
-#[embassy_executor::task]
-async fn random_90s(_spawner: Spawner) {
-    let mut rng = RoscRng;
-    let sender = EVENT_CHANNEL.sender();
-
-    loop {
-        Timer::after(Duration::from_secs(90)).await;
-        let random_number = rng.next_u32();
-        sender.send(Events::ThirdRandomSeed(random_number)).await;
     }
 }
 

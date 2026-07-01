@@ -16,7 +16,7 @@ use embassy_rp::adc::{Adc, Channel, Config, InterruptHandler as AdcInterruptHand
 use embassy_rp::bind_interrupts;
 use embassy_rp::bootsel::is_bootsel_pressed;
 use embassy_rp::clocks::RoscRng;
-use embassy_rp::gpio::{Input, Pull};
+use embassy_rp::gpio::{Flex, Pull};
 use embassy_rp::peripherals::{self, USB};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -31,8 +31,10 @@ assign_resources! {
         adc: ADC,
         pin_29: PIN_29,
     },
-    vbus: Vbus {
-        pin_24: PIN_24,
+    keyboard: Keyboard {
+        row: PIN_11,
+        col0: PIN_12,
+        col1: PIN_13,
     },
 }
 
@@ -52,12 +54,12 @@ async fn logger_task(driver: Driver<'static, USB>) {
 
 /// Events that worker tasks send to the orchestrator
 enum Events {
-    UsbPowered(bool),      // USB connection state changed
     VsysVoltage(f32),      // New voltage reading
     FirstRandomSeed(u32),  // Random number from 30s timer
     SecondRandomSeed(u32), // Random number from 60s timer
     ThirdRandomSeed(u32),  // Random number from 90s timer
     ResetFirstRandomSeed,  // Signal to reset the first counter
+    KeyPressed(u8, bool),  // Key index, pressed state
 }
 
 /// Commands that can control task behavior.
@@ -70,7 +72,6 @@ enum Commands {
 /// The central state of our system, shared between tasks.
 #[derive(Clone, Format)]
 struct State {
-    usb_powered: bool,
     vsys_voltage: f32,
     first_random_seed: u32,
     second_random_seed: u32,
@@ -78,19 +79,19 @@ struct State {
     first_random_seed_task_running: bool,
     times_we_got_first_random_seed: u8,
     maximum_times_we_want_first_random_seed: u8,
+    key0_pressed: bool,
+    key1_pressed: bool,
 }
 
 /// A formatted view of the system status, used for logging. Used for the below `get_system_summary` fn.
 #[derive(Debug, Format)]
 struct SystemStatus {
-    power_source: &'static str,
     voltage: f32,
 }
 
 impl State {
     const fn new() -> Self {
         Self {
-            usb_powered: false,
             vsys_voltage: 0.0,
             first_random_seed: 0,
             second_random_seed: 0,
@@ -98,6 +99,8 @@ impl State {
             first_random_seed_task_running: false,
             times_we_got_first_random_seed: 0,
             maximum_times_we_want_first_random_seed: 3,
+            key0_pressed: false,
+            key1_pressed: false,
         }
     }
 
@@ -105,11 +108,6 @@ impl State {
     /// Shows how to create methods that work with shared state.
     fn get_system_summary(&self) -> SystemStatus {
         SystemStatus {
-            power_source: if self.usb_powered {
-                "USB powered"
-            } else {
-                "Battery powered"
-            },
             voltage: self.vsys_voltage,
         }
     }
@@ -141,12 +139,14 @@ async fn main(spawner: Spawner) {
     spawner.spawn(random_60s(spawner).unwrap());
     spawner.spawn(random_90s(spawner).unwrap());
     // `random_30s` is not spawned here, but in the orchestrate task depending on state
-    spawner.spawn(usb_power(spawner, r.vbus).unwrap());
     spawner.spawn(vsys_voltage(spawner, r.vsys).unwrap());
     spawner.spawn(consumer(spawner).unwrap());
 
     // Spawn BOOTSEL button monitor
     spawner.spawn(bootsel_button(p.BOOTSEL).unwrap());
+
+    // Spawn keyboard matrix scanner
+    spawner.spawn(keyboard_scanner(spawner, r.keyboard).unwrap());
 }
 
 /// Task that monitors BOOTSEL button and reports via USB serial.
@@ -160,6 +160,49 @@ async fn bootsel_button(mut bootsel: Peri<'static, peripherals::BOOTSEL>) {
             log::info!("bootsel is now {}", pressed);
         }
         previous = pressed;
+    }
+}
+
+/// Task that scans a 1x2 key matrix and reports key events.
+/// NeoKey uses COL2ROW diode orientation: drive columns low, read row with pull-up.
+#[embassy_executor::task]
+async fn keyboard_scanner(_spawner: Spawner, r: Keyboard) {
+    let mut row = Flex::new(r.row);
+    let mut col0 = Flex::new(r.col0);
+    let mut col1 = Flex::new(r.col1);
+
+    let sender = EVENT_CHANNEL.sender();
+    let mut prev = [false; 2];
+
+    loop {
+        Timer::after_millis(10).await;
+
+        // Scan col0: drive col0 low, col1 high-Z, read row with pull-up
+        row.set_pull(Pull::Up);
+        row.set_as_input();
+        col0.set_as_output();
+        col0.set_low();
+        col1.set_pull(Pull::None);
+        col1.set_as_input();
+        Timer::after_micros(50).await;
+        let pressed0 = !row.is_high();
+
+        // Scan col1: drive col1 low, col0 high-Z, read row with pull-up
+        col1.set_as_output();
+        col1.set_low();
+        col0.set_pull(Pull::None);
+        col0.set_as_input();
+        Timer::after_micros(50).await;
+        let pressed1 = !row.is_high();
+
+        let states = [pressed0, pressed1];
+        for (i, &pressed) in states.iter().enumerate() {
+            if pressed != prev[i] {
+                log::info!("Key {} {}", i, if pressed { "pressed" } else { "released" });
+                sender.send(Events::KeyPressed(i as u8, pressed)).await;
+            }
+        }
+        prev = states;
     }
 }
 
@@ -178,11 +221,6 @@ async fn orchestrate(spawner: Spawner) {
             let mut state = SYSTEM_STATE.lock().await;
 
             match event {
-                Events::UsbPowered(usb_powered) => {
-                    state.usb_powered = usb_powered;
-                    log::info!("Usb powered: {}", usb_powered);
-                    log::info!("System summary: {:?}", state.get_system_summary());
-                }
                 Events::VsysVoltage(voltage) => {
                     state.vsys_voltage = voltage;
                     log::info!("Vsys voltage: {}", voltage);
@@ -208,6 +246,14 @@ async fn orchestrate(spawner: Spawner) {
                     state.times_we_got_first_random_seed = 0;
                     state.first_random_seed = 0;
                     log::info!("Resetting the first random seed counter");
+                }
+                Events::KeyPressed(key, pressed) => {
+                    log::info!("Key {} {}", key, if pressed { "pressed" } else { "released" });
+                    match key {
+                        0 => state.key0_pressed = pressed,
+                        1 => state.key1_pressed = pressed,
+                        _ => {}
+                    }
                 }
             }
 
@@ -245,14 +291,16 @@ async fn consumer(_spawner: Spawner) {
 
         let state = SYSTEM_STATE.lock().await;
         log::info!(
-            "State update - {:?} | Seeds - First: {} (count: {}/{}, running: {}), Second: {}, Third: {}",
+            "State update - {:?} | Seeds - First: {} (count: {}/{}, running: {}), Second: {}, Third: {} | Keys: {} {}",
             state.get_system_summary(),
             state.first_random_seed,
             state.times_we_got_first_random_seed,
             state.maximum_times_we_want_first_random_seed,
             state.first_random_seed_task_running,
             state.second_random_seed,
-            state.third_random_seed
+            state.third_random_seed,
+            state.key0_pressed,
+            state.key1_pressed
         );
     }
 }
@@ -313,18 +361,6 @@ async fn random_90s(_spawner: Spawner) {
         Timer::after(Duration::from_secs(90)).await;
         let random_number = rng.next_u32();
         sender.send(Events::ThirdRandomSeed(random_number)).await;
-    }
-}
-
-/// Task that monitors USB power connection. As an example of some Interrupt somewhere.
-#[embassy_executor::task]
-pub async fn usb_power(_spawner: Spawner, r: Vbus) {
-    let mut vbus_in = Input::new(r.pin_24, Pull::None);
-    let sender = EVENT_CHANNEL.sender();
-
-    loop {
-        sender.send(Events::UsbPowered(vbus_in.is_high())).await;
-        vbus_in.wait_for_any_edge().await;
     }
 }
 

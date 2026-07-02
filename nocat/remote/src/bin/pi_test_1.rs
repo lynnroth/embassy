@@ -12,7 +12,6 @@ use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_rp::Peri;
-use embassy_rp::adc::{Adc, Channel as AdcChannel, Config as AdcConfig, InterruptHandler as AdcInterruptHandler};
 use embassy_rp::bind_interrupts;
 use embassy_rp::dma;
 use embassy_rp::gpio::{Flex, Level, Output, Pull};
@@ -36,10 +35,6 @@ use {defmt_rtt as _, panic_probe as _};
 
 // Hardware resource assignment
 assign_resources! {
-    vsys: Vsys {
-        adc: ADC,
-        pin_29: PIN_29,
-    },
     keyboard: Keyboard {
         // Feather header D11/D12/D13 — free, not used by RFM69
         row: PIN_11,
@@ -61,7 +56,6 @@ assign_resources! {
 
 // Interrupt bindings
 bind_interrupts!(struct Irqs {
-    ADC_IRQ_FIFO => AdcInterruptHandler;
     DMA_IRQ_0 => dma::InterruptHandler<peripherals::DMA_CH0>, dma::InterruptHandler<peripherals::DMA_CH1>, dma::InterruptHandler<peripherals::DMA_CH2>;
     PIO0_IRQ_0 => PioInterruptHandler<peripherals::PIO0>;
 });
@@ -108,7 +102,6 @@ async fn logger_task(driver: Driver<'static, USB>) {
 
 /// Events that worker tasks send to the orchestrator
 enum Events {
-    VsysVoltage(f32),     // New voltage reading
     KeyPressed(u8, bool), // Key index, pressed state
 }
 
@@ -120,28 +113,15 @@ enum RadioPacket {
 /// The central state of our system, shared between tasks.
 #[derive(Clone, Format)]
 struct State {
-    vsys_voltage: f32,
     key0_pressed: bool,
     key1_pressed: bool,
-}
-
-#[derive(Debug, Format)]
-struct SystemStatus {
-    voltage: f32,
 }
 
 impl State {
     const fn new() -> Self {
         Self {
-            vsys_voltage: 0.0,
             key0_pressed: false,
             key1_pressed: false,
-        }
-    }
-
-    fn get_system_summary(&self) -> SystemStatus {
-        SystemStatus {
-            voltage: self.vsys_voltage,
         }
     }
 }
@@ -261,7 +241,6 @@ async fn main(spawner: Spawner) {
 
     // Spawn orchestrator tasks
     spawner.spawn(orchestrate(spawner).unwrap());
-    spawner.spawn(vsys_voltage(spawner, r.vsys).unwrap());
     spawner.spawn(consumer(spawner).unwrap());
     spawner.spawn(keyboard_scanner(spawner, r.keyboard).unwrap());
 
@@ -449,10 +428,6 @@ async fn orchestrate(_spawner: Spawner) {
             let mut state = SYSTEM_STATE.lock().await;
 
             match event {
-                Events::VsysVoltage(voltage) => {
-                    state.vsys_voltage = voltage;
-                    log::info!("Vsys voltage: {}", voltage);
-                }
                 Events::KeyPressed(key, pressed) => {
                     log::info!("Key {} {}", key, if pressed { "pressed" } else { "released" });
                     match key {
@@ -476,26 +451,9 @@ async fn consumer(_spawner: Spawner) {
 
         let state = SYSTEM_STATE.lock().await;
         log::info!(
-            "State update - {:?} | Keys: {} {}",
-            state.get_system_summary(),
+            "State: keys={} {}",
             state.key0_pressed,
             state.key1_pressed
         );
-    }
-}
-
-/// Task that reads system voltage through ADC.
-#[embassy_executor::task]
-pub async fn vsys_voltage(_spawner: Spawner, r: Vsys) {
-    let mut adc = Adc::new(r.adc, Irqs, AdcConfig::default());
-    let vsys_in = r.pin_29;
-    let mut channel = AdcChannel::new_pin(vsys_in, Pull::None);
-    let sender = EVENT_CHANNEL.sender();
-
-    loop {
-        Timer::after(Duration::from_secs(30)).await;
-        let adc_value = adc.read(&mut channel).await.unwrap();
-        let voltage = (adc_value as f32) * 3.3 * 3.0 / 4096.0;
-        sender.send(Events::VsysVoltage(voltage)).await;
     }
 }

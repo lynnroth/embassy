@@ -1,51 +1,96 @@
-//! This example demonstrates orchestration between tasks, plus USB serial logging
-//! and BOOTSEL button monitoring.
+//! Key matrix scanner + RFM69 radio transmitter
 //!
-//! It combines the orchestrate_tasks example with USB serial output and bootsel
-//! button checking from button_bootsel.
+//! Scans a 1x2 NeoKey matrix and broadcasts key events over RFM69 radio
+//! to another board, while also logging locally via USB serial.
 
 #![no_std]
 #![no_main]
 
 use assign_resources::assign_resources;
 use defmt::Format;
+use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
 use embassy_rp::Peri;
-use embassy_rp::adc::{Adc, Channel, Config, InterruptHandler as AdcInterruptHandler};
+use embassy_rp::adc::{Adc, Channel as AdcChannel, Config as AdcConfig, InterruptHandler as AdcInterruptHandler};
 use embassy_rp::bind_interrupts;
 use embassy_rp::bootsel::is_bootsel_pressed;
-use embassy_rp::clocks::RoscRng;
-use embassy_rp::gpio::{Flex, Pull};
-use embassy_rp::peripherals::{self, USB};
+use embassy_rp::dma;
+use embassy_rp::gpio::{Flex, Level, Output, Pull};
+use embassy_rp::peripherals::{self, SPI1, USB};
+use embassy_rp::spi::{Config as SpiConfig, Spi};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel as SyncChannel;
 use embassy_sync::mutex::Mutex;
-use embassy_sync::{channel, signal};
-use embassy_time::{Duration, Timer};
+use embassy_sync::signal::Signal;
+use embassy_time::{Delay, Duration, Timer};
+use rfm69_async::{Address, Flags, MacTiming, Packet, Rfm69, Runner, Stack, StackResources, Transceiver, TrxError, config};
+use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
-// Hardware resource assignment. See other examples for different ways of doing this.
+// Hardware resource assignment
 assign_resources! {
     vsys: Vsys {
         adc: ADC,
         pin_29: PIN_29,
     },
     keyboard: Keyboard {
+        // Feather header D11/D12/D13 — free, not used by RFM69
         row: PIN_11,
         col0: PIN_12,
         col1: PIN_13,
     },
+    radio: Radio {
+        // Feather RP2040 RFM69 — SPI1 bus per Adafruit board definition
+        // SCK=GPIO14, MOSI=GPIO15, MISO=GPIO8
+        // CS=GPIO16, RST=GPIO17, DIO0=GPIO21
+        sck: PIN_14,
+        mosi: PIN_15,
+        miso: PIN_8,
+        cs: PIN_16,
+        reset: PIN_17,
+        dio0: PIN_21,
+    },
 }
 
-// Interrupt binding - required for hardware peripherals like ADC
+// Interrupt bindings
 bind_interrupts!(struct Irqs {
     ADC_IRQ_FIFO => AdcInterruptHandler;
+    DMA_IRQ_0 => dma::InterruptHandler<peripherals::DMA_CH0>, dma::InterruptHandler<peripherals::DMA_CH1>;
 });
 
 bind_interrupts!(struct UsbIrqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
 });
+
+// Radio SPI type aliases
+type RadioSpi = SpiDevice<'static, NoopRawMutex, Spi<'static, SPI1, embassy_rp::spi::Async>, Output<'static>>;
+type RadioDriver = Rfm69<RadioSpi, Output<'static>, embassy_rp::gpio::Input<'static>, Delay>;
+
+/// Radio wrapper that remembers config for recovery on link-down
+struct RecoveringRadio {
+    rfm: RadioDriver,
+    network_id: u8,
+    frequency: u32,
+}
+
+impl Transceiver for RecoveringRadio {
+    async fn send(&mut self, packet: &Packet) -> Result<(), TrxError> {
+        self.rfm.send(packet).await.map_err(Into::into)
+    }
+
+    async fn recv(&mut self) -> Result<Packet, TrxError> {
+        self.rfm.recv().await.map_err(Into::into)
+    }
+
+    async fn recover(&mut self) -> Result<(), TrxError> {
+        log::warn!("RFM69 recovering from link down");
+        config::my_defaults(&mut self.rfm, self.network_id, self.frequency)
+            .await
+            .map_err(Into::into)
+    }
+}
 
 #[embassy_executor::task]
 async fn logger_task(driver: Driver<'static, USB>) {
@@ -58,28 +103,19 @@ enum Events {
     KeyPressed(u8, bool), // Key index, pressed state
 }
 
-/// Commands that can control task behavior.
-/// Currently only used to stop tasks, but could be extended for other controls.
-enum Commands {
-    /// Signals a task to stop execution
-    Stop,
+/// Radio-bound packets
+enum RadioPacket {
+    KeyEvent(u8, bool),
 }
 
 /// The central state of our system, shared between tasks.
 #[derive(Clone, Format)]
 struct State {
     vsys_voltage: f32,
-    first_random_seed: u32,
-    second_random_seed: u32,
-    third_random_seed: u32,
-    first_random_seed_task_running: bool,
-    times_we_got_first_random_seed: u8,
-    maximum_times_we_want_first_random_seed: u8,
     key0_pressed: bool,
     key1_pressed: bool,
 }
 
-/// A formatted view of the system status, used for logging. Used for the below `get_system_summary` fn.
 #[derive(Debug, Format)]
 struct SystemStatus {
     voltage: f32,
@@ -89,19 +125,11 @@ impl State {
     const fn new() -> Self {
         Self {
             vsys_voltage: 0.0,
-            first_random_seed: 0,
-            second_random_seed: 0,
-            third_random_seed: 0,
-            first_random_seed_task_running: false,
-            times_we_got_first_random_seed: 0,
-            maximum_times_we_want_first_random_seed: 3,
             key0_pressed: false,
             key1_pressed: false,
         }
     }
 
-    /// Returns a formatted summary of power state and voltage.
-    /// Shows how to create methods that work with shared state.
     fn get_system_summary(&self) -> SystemStatus {
         SystemStatus {
             voltage: self.vsys_voltage,
@@ -109,17 +137,17 @@ impl State {
     }
 }
 
-/// The shared state protected by a mutex
+/// Shared state
 static SYSTEM_STATE: Mutex<CriticalSectionRawMutex, State> = Mutex::new(State::new());
 
 /// Channel for events from worker tasks to the orchestrator
-static EVENT_CHANNEL: channel::Channel<CriticalSectionRawMutex, Events, 10> = channel::Channel::new();
+static EVENT_CHANNEL: SyncChannel<CriticalSectionRawMutex, Events, 10> = SyncChannel::new();
 
-/// Signal used to stop the first random number task
-static STOP_FIRST_RANDOM_SIGNAL: signal::Signal<CriticalSectionRawMutex, Commands> = signal::Signal::new();
+/// Channel for radio-bound packets
+static RADIO_CHANNEL: SyncChannel<CriticalSectionRawMutex, RadioPacket, 10> = SyncChannel::new();
 
 /// Signal for notifying about state changes
-static STATE_CHANGED: signal::Signal<CriticalSectionRawMutex, ()> = signal::Signal::new();
+static STATE_CHANGED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -130,16 +158,90 @@ async fn main(spawner: Spawner) {
     let driver = Driver::new(p.USB, UsbIrqs);
     spawner.spawn(logger_task(driver).unwrap());
 
+    // --- RFM69 Radio Setup ---
+    // Adafruit Feather RP2040 RFM69: SPI1 bus on GPIO14(SCK)/GPIO15(MOSI)/GPIO8(MISO)
+    // CS=GPIO16, RST=GPIO17, DIO0=GPIO21
+    let mut spi_cfg = SpiConfig::default();
+    spi_cfg.frequency = 8_000_000; // 8 MHz — RFM69 supports up to 10 MHz
+    let mut spi = Spi::new(p.SPI1, r.radio.sck, r.radio.mosi, r.radio.miso, p.DMA_CH0, p.DMA_CH1, Irqs, spi_cfg);
+
+    let mut cs_pin = Output::new(r.radio.cs, Level::High);
+    let mut rst_pin = Output::new(r.radio.reset, Level::Low); // RFM69 reset is active-high; LOW = out of reset
+    Timer::after_millis(10).await;
+
+    log::info!("RFM69 radio: SPI1 sck=14 mosi=15 miso=8 cs=16 rst=17 dio0=21");
+
+    // Construct SpiDevice for the driver
+    static SPI_BUS: StaticCell<Mutex<NoopRawMutex, Spi<'static, SPI1, embassy_rp::spi::Async>>> = StaticCell::new();
+    let spi_bus = SPI_BUS.init(Mutex::new(spi));
+
+    let dio0 = Some(embassy_rp::gpio::Input::new(r.radio.dio0, Pull::None));
+
+    let rfm_spi = SpiDevice::new(spi_bus, cs_pin);
+
+    let network_id = 42;
+    let frequency = 915_000_000;
+    let mut rfm = Rfm69::new(rfm_spi, rst_pin, dio0, Delay);
+
+    log::info!("RFM69 resetting...");
+    match rfm.reset().await {
+        Ok(()) => log::info!("RFM69 reset OK, version 0x24"),
+        Err(e) => {
+            log::error!("RFM69 reset/version error: {:?}", e);
+            Timer::after(Duration::from_secs(5)).await;
+            panic!();
+        }
+    }
+
+    log::info!("Applying radio config...");
+    if let Err(e) = config::my_defaults(&mut rfm, network_id, frequency).await {
+        log::error!("Radio config error: {:?}", e);
+        Timer::after(Duration::from_secs(5)).await;
+        panic!();
+    }
+
+    let trx = RecoveringRadio { rfm, network_id, frequency };
+    let own_address = Address::Unicast(1);
+    static RESOURCES: StaticCell<StackResources> = StaticCell::new();
+    let resources = RESOURCES.init(StackResources::new());
+    let (stack, runner) = Stack::new(trx, own_address, resources, MacTiming::default());
+
+    log::info!("RFM69 radio ready, address {:?} freq {} MHz", own_address, frequency / 1_000_000);
+
     // Spawn orchestrator tasks
     spawner.spawn(orchestrate(spawner).unwrap());
     spawner.spawn(vsys_voltage(spawner, r.vsys).unwrap());
     spawner.spawn(consumer(spawner).unwrap());
-
-    // Spawn BOOTSEL button monitor
     spawner.spawn(bootsel_button(p.BOOTSEL).unwrap());
-
-    // Spawn keyboard matrix scanner
     spawner.spawn(keyboard_scanner(spawner, r.keyboard).unwrap());
+
+    // Spawn radio tasks
+    spawner.spawn(radio_runner_task(runner).unwrap());
+    spawner.spawn(radio_tx_task(stack).unwrap());
+}
+
+/// Drives the RFM69 radio runner (always-listens, arbitrates TX/RX)
+#[embassy_executor::task]
+async fn radio_runner_task(mut runner: Runner<'static, RecoveringRadio>) {
+    runner.run().await;
+}
+
+/// Listens for key events and broadcasts them over RFM69
+#[embassy_executor::task]
+async fn radio_tx_task(stack: Stack<'static>) {
+    let receiver = RADIO_CHANNEL.receiver();
+    loop {
+        let packet = receiver.receive().await;
+        let payload = match packet {
+            RadioPacket::KeyEvent(key, pressed) => {
+                [key, if pressed { 1 } else { 0 }]
+            }
+        };
+        match stack.send(Address::Broadcast, Flags::None, &payload).await {
+            Ok(()) => log::info!("Radio TX: key={} pressed={}", payload[0], payload[1] != 0),
+            Err(e) => log::warn!("Radio TX failed: {:?}", e),
+        }
+    }
 }
 
 /// Task that monitors BOOTSEL button and reports via USB serial.
@@ -164,7 +266,8 @@ async fn keyboard_scanner(_spawner: Spawner, r: Keyboard) {
     let mut col0 = Flex::new(r.col0);
     let mut col1 = Flex::new(r.col1);
 
-    let sender = EVENT_CHANNEL.sender();
+    let event_sender = EVENT_CHANNEL.sender();
+    let radio_sender = RADIO_CHANNEL.sender();
     let mut prev = [false; 2];
 
     loop {
@@ -192,7 +295,8 @@ async fn keyboard_scanner(_spawner: Spawner, r: Keyboard) {
         for (i, &pressed) in states.iter().enumerate() {
             if pressed != prev[i] {
                 log::info!("Key {} {}", i, if pressed { "pressed" } else { "released" });
-                sender.send(Events::KeyPressed(i as u8, pressed)).await;
+                event_sender.send(Events::KeyPressed(i as u8, pressed)).await;
+                radio_sender.send(RadioPacket::KeyEvent(i as u8, pressed)).await;
             }
         }
         prev = states;
@@ -206,10 +310,8 @@ async fn orchestrate(_spawner: Spawner) {
     log::info!("Starting up.");
 
     loop {
-        // Do nothing until we receive any event
         let event = receiver.receive().await;
 
-        // Scope in which we want to lock the system state. As an alternative we could also call `drop` on the state
         {
             let mut state = SYSTEM_STATE.lock().await;
 
@@ -237,7 +339,6 @@ async fn orchestrate(_spawner: Spawner) {
 #[embassy_executor::task]
 async fn consumer(_spawner: Spawner) {
     loop {
-        // Wait for state change notification
         STATE_CHANGED.wait().await;
 
         let state = SYSTEM_STATE.lock().await;
@@ -250,12 +351,12 @@ async fn consumer(_spawner: Spawner) {
     }
 }
 
-/// Task that reads system voltage through ADC. As an example of some continuous sensor reading.
+/// Task that reads system voltage through ADC.
 #[embassy_executor::task]
 pub async fn vsys_voltage(_spawner: Spawner, r: Vsys) {
-    let mut adc = Adc::new(r.adc, Irqs, Config::default());
+    let mut adc = Adc::new(r.adc, Irqs, AdcConfig::default());
     let vsys_in = r.pin_29;
-    let mut channel = Channel::new_pin(vsys_in, Pull::None);
+    let mut channel = AdcChannel::new_pin(vsys_in, Pull::None);
     let sender = EVENT_CHANNEL.sender();
 
     loop {

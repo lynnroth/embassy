@@ -26,9 +26,8 @@ use embassy_sync::channel::Channel as SyncChannel;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Delay, Duration, Timer, with_timeout};
-use rfm69_async::{
-    Address, Flags, MacTiming, Packet, Rfm69, Runner, Stack, StackResources, Transceiver, TrxError, config,
-};
+use rfm69_async::{Address, Flags, Packet, Rfm69, config};
+use rfm69_async::registers::OpMode;
 use smart_leds::RGB8;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
@@ -70,30 +69,6 @@ type RadioDriver = Rfm69<RadioSpi, Output<'static>, embassy_rp::gpio::Input<'sta
 
 // NeoPixel type alias
 type NeoPixel = PioWs2812<'static, PIO0, 0, Grb>;
-
-/// Radio wrapper that remembers config for recovery on link-down
-struct RecoveringRadio {
-    rfm: RadioDriver,
-    network_id: u8,
-    frequency: u32,
-}
-
-impl Transceiver for RecoveringRadio {
-    async fn send(&mut self, packet: &Packet) -> Result<(), TrxError> {
-        self.rfm.send(packet).await.map_err(Into::into)
-    }
-
-    async fn recv(&mut self) -> Result<Packet, TrxError> {
-        self.rfm.recv().await.map_err(Into::into)
-    }
-
-    async fn recover(&mut self) -> Result<(), TrxError> {
-        log::warn!("RFM69 recovering from link down");
-        config::my_defaults(&mut self.rfm, self.network_id, self.frequency)
-            .await
-            .map_err(Into::into)
-    }
-}
 
 #[embassy_executor::task]
 async fn logger_task(driver: Driver<'static, USB>) {
@@ -210,21 +185,9 @@ async fn main(spawner: Spawner) {
     }
     log::info!("TX power set to +20 dBm (PA1+PA2 boost)");
 
-    let trx = RecoveringRadio {
-        rfm,
-        network_id,
-        frequency,
-    };
-    let own_address = Address::Unicast(1);
-    static RESOURCES: StaticCell<StackResources> = StaticCell::new();
-    let resources = RESOURCES.init(StackResources::new());
-    let (stack, runner) = Stack::new(trx, own_address, resources, MacTiming::default());
-
-    log::info!(
-        "RFM69 radio ready, address {:?} freq {} MHz",
-        own_address,
-        frequency / 1_000_000
-    );
+    // Put radio to sleep until a key is pressed (saves ~16mA vs always-RX)
+    rfm.set_mode(OpMode::Sleep).await.ok();
+    log::info!("RFM69 radio ready, sleeping until key press");
 
     // ── NeoPixel Setup (GPIO4) ──
     // Built-in NeoPixel on the Feather RP2040 RFM69 — displays signal
@@ -244,56 +207,60 @@ async fn main(spawner: Spawner) {
     spawner.spawn(consumer(spawner).unwrap());
     spawner.spawn(keyboard_scanner(spawner, r.keyboard).unwrap());
 
-    // Spawn radio tasks
-    spawner.spawn(radio_runner_task(runner).unwrap());
-    spawner.spawn(radio_tx_task(stack).unwrap());
-    spawner.spawn(radio_rx_task(stack).unwrap());
+    // Spawn radio task (sleeps between key presses for power saving)
+    spawner.spawn(radio_task(rfm).unwrap());
     spawner.spawn(neopixel_task(ws2812).unwrap());
 }
 
-/// Drives the RFM69 radio runner (always-listens, arbitrates TX/RX)
+/// Radio task: sleeps the RFM69 between key presses to save ~16mA.
+/// On key press: wakes radio, TX the key event, briefly RX for RSSI reply,
+/// then back to sleep.
 #[embassy_executor::task]
-async fn radio_runner_task(mut runner: Runner<'static, RecoveringRadio>) {
-    runner.run().await;
-}
-
-/// Listens for key events and broadcasts them over RFM69
-#[embassy_executor::task]
-async fn radio_tx_task(stack: Stack<'static>) {
+async fn radio_task(mut rfm: RadioDriver) {
+    log::info!("Radio task started");
     let receiver = RADIO_CHANNEL.receiver();
+    let own_address = Address::Unicast(1);
+
     loop {
+        // Radio sleeps while waiting for key events (~0.1µA vs ~16mA in RX)
         let packet = receiver.receive().await;
         let payload = match packet {
             RadioPacket::KeyEvent(key, pressed) => [key, if pressed { 1 } else { 0 }],
         };
-        match stack.send(Address::Broadcast, Flags::None, &payload).await {
+
+        // Wake radio and send key event
+        let tx_packet = Packet::new(
+            own_address,
+            Address::Broadcast,
+            Flags::None,
+            &payload,
+        )
+        .unwrap();
+
+        match rfm.send(&tx_packet).await {
             Ok(()) => log::info!("Radio TX: key={} pressed={}", payload[0], payload[1] != 0),
             Err(e) => log::warn!("Radio TX failed: {:?}", e),
         }
-    }
-}
 
-/// Listens for RSSI reply packets from the receiver and signals the NeoPixel task.
-/// Reply format: [rssi_byte, key_index] where key_index is 0/1 on press, 0xFF on release.
-#[embassy_executor::task]
-async fn radio_rx_task(stack: Stack<'static>) {
-    loop {
-        let packet = stack.recv().await;
-        if packet.data.len() >= 2 {
-            let rssi = packet.data[0] as i8 as i16;
-            let key_reply = packet.data[1];
-            log::info!("Radio RX: RSSI reply = {} dBm, key={}", rssi, key_reply);
-            RSSI_SIGNAL.signal(rssi);
-            // Flash red/blue on key press (0 or 1), skip 0xFF (release)
-            if key_reply <= 1 {
-                KEY_FLASH_SIGNAL.signal(key_reply);
+        // Briefly listen for RSSI reply (500ms timeout)
+        match with_timeout(Duration::from_millis(500), rfm.recv()).await {
+            Ok(Ok(reply)) => {
+                if reply.data.len() >= 2 {
+                    let rssi = reply.data[0] as i8 as i16;
+                    let key_reply = reply.data[1];
+                    log::info!("Radio RX: RSSI reply = {} dBm, key={}", rssi, key_reply);
+                    RSSI_SIGNAL.signal(rssi);
+                    if key_reply <= 1 {
+                        KEY_FLASH_SIGNAL.signal(key_reply);
+                    }
+                }
             }
-        } else if packet.data.len() >= 1 {
-            // Backward compat: 1-byte reply (RSSI only)
-            let rssi = packet.data[0] as i8 as i16;
-            log::info!("Radio RX: RSSI reply = {} dBm", rssi);
-            RSSI_SIGNAL.signal(rssi);
+            Ok(Err(e)) => log::warn!("Radio RX error: {:?}", e),
+            Err(_) => log::info!("Radio RX: no reply (timeout)"),
         }
+
+        // Back to sleep
+        rfm.set_mode(OpMode::Sleep).await.ok();
     }
 }
 

@@ -14,7 +14,6 @@ use embassy_futures::select::{Either, select};
 use embassy_rp::Peri;
 use embassy_rp::adc::{Adc, Channel as AdcChannel, Config as AdcConfig, InterruptHandler as AdcInterruptHandler};
 use embassy_rp::bind_interrupts;
-use embassy_rp::bootsel::is_bootsel_pressed;
 use embassy_rp::dma;
 use embassy_rp::gpio::{Flex, Level, Output, Pull};
 use embassy_rp::peripherals::{self, PIO0, SPI1, USB};
@@ -264,7 +263,6 @@ async fn main(spawner: Spawner) {
     spawner.spawn(orchestrate(spawner).unwrap());
     spawner.spawn(vsys_voltage(spawner, r.vsys).unwrap());
     spawner.spawn(consumer(spawner).unwrap());
-    spawner.spawn(bootsel_button(p.BOOTSEL).unwrap());
     spawner.spawn(keyboard_scanner(spawner, r.keyboard).unwrap());
 
     // Spawn radio tasks
@@ -390,20 +388,6 @@ async fn neopixel_task(ws2812: &'static mut NeoPixel) {
                     .await;
             }
         }
-    }
-}
-
-/// Task that monitors BOOTSEL button and reports via USB serial.
-#[embassy_executor::task]
-async fn bootsel_button(mut bootsel: Peri<'static, peripherals::BOOTSEL>) {
-    let mut previous = false;
-    loop {
-        Timer::after_micros(10).await;
-        let pressed = is_bootsel_pressed(bootsel.reborrow());
-        if pressed != previous {
-            log::info!("bootsel is now {}", pressed);
-        }
-        previous = pressed;
     }
 }
 

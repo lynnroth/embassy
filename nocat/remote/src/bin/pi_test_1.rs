@@ -16,7 +16,9 @@ use embassy_rp::bind_interrupts;
 use embassy_rp::bootsel::is_bootsel_pressed;
 use embassy_rp::dma;
 use embassy_rp::gpio::{Flex, Level, Output, Pull};
-use embassy_rp::peripherals::{self, SPI1, USB};
+use embassy_rp::peripherals::{self, PIO0, SPI1, USB};
+use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
+use embassy_rp::pio_programs::ws2812::{Grb, PioWs2812, PioWs2812Program};
 use embassy_rp::spi::{Config as SpiConfig, Spi};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
@@ -25,7 +27,9 @@ use embassy_sync::channel::Channel as SyncChannel;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Delay, Duration, Timer};
+use embassy_futures::select::{select, Either};
 use rfm69_async::{Address, Flags, MacTiming, Packet, Rfm69, Runner, Stack, StackResources, Transceiver, TrxError, config};
+use smart_leds::RGB8;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -57,7 +61,8 @@ assign_resources! {
 // Interrupt bindings
 bind_interrupts!(struct Irqs {
     ADC_IRQ_FIFO => AdcInterruptHandler;
-    DMA_IRQ_0 => dma::InterruptHandler<peripherals::DMA_CH0>, dma::InterruptHandler<peripherals::DMA_CH1>;
+    DMA_IRQ_0 => dma::InterruptHandler<peripherals::DMA_CH0>, dma::InterruptHandler<peripherals::DMA_CH1>, dma::InterruptHandler<peripherals::DMA_CH2>;
+    PIO0_IRQ_0 => PioInterruptHandler<peripherals::PIO0>;
 });
 
 bind_interrupts!(struct UsbIrqs {
@@ -67,6 +72,9 @@ bind_interrupts!(struct UsbIrqs {
 // Radio SPI type aliases
 type RadioSpi = SpiDevice<'static, NoopRawMutex, Spi<'static, SPI1, embassy_rp::spi::Async>, Output<'static>>;
 type RadioDriver = Rfm69<RadioSpi, Output<'static>, embassy_rp::gpio::Input<'static>, Delay>;
+
+// NeoPixel type alias
+type NeoPixel = PioWs2812<'static, PIO0, 0, Grb>;
 
 /// Radio wrapper that remembers config for recovery on link-down
 struct RecoveringRadio {
@@ -149,6 +157,12 @@ static RADIO_CHANNEL: SyncChannel<CriticalSectionRawMutex, RadioPacket, 10> = Sy
 /// Signal for notifying about state changes
 static STATE_CHANGED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+/// Signal for the latest RSSI reading (dBm) from received radio packets
+static RSSI_SIGNAL: Signal<CriticalSectionRawMutex, i16> = Signal::new();
+
+/// Signal for key flash events (key index 0=red, 1=blue)
+static KEY_FLASH_SIGNAL: Signal<CriticalSectionRawMutex, u8> = Signal::new();
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
@@ -208,6 +222,26 @@ async fn main(spawner: Spawner) {
 
     log::info!("RFM69 radio ready, address {:?} freq {} MHz", own_address, frequency / 1_000_000);
 
+    // ── NeoPixel Setup (GPIO4) ──
+    // Built-in NeoPixel on the Feather RP2040 RFM69 — displays signal
+    // strength (RSSI) reported back by the receiver.
+    static PIO_COMMON: StaticCell<embassy_rp::pio::Common<'static, PIO0>> = StaticCell::new();
+    static WS2812_PROGRAM: StaticCell<PioWs2812Program<'static, PIO0>> = StaticCell::new();
+    static WS2812: StaticCell<NeoPixel> = StaticCell::new();
+
+    let Pio { common, sm0, .. } = Pio::new(p.PIO0, Irqs);
+    let common = PIO_COMMON.init(common);
+    let ws2812_program = WS2812_PROGRAM.init(PioWs2812Program::new(common));
+    let ws2812 = WS2812.init(PioWs2812::new(
+        common,
+        sm0,
+        p.DMA_CH2,
+        Irqs,
+        p.PIN_4,
+        ws2812_program,
+    ));
+    log::info!("NeoPixel initialized on GPIO4");
+
     // Spawn orchestrator tasks
     spawner.spawn(orchestrate(spawner).unwrap());
     spawner.spawn(vsys_voltage(spawner, r.vsys).unwrap());
@@ -218,6 +252,8 @@ async fn main(spawner: Spawner) {
     // Spawn radio tasks
     spawner.spawn(radio_runner_task(runner).unwrap());
     spawner.spawn(radio_tx_task(stack).unwrap());
+    spawner.spawn(radio_rx_task(stack).unwrap());
+    spawner.spawn(neopixel_task(ws2812).unwrap());
 }
 
 /// Drives the RFM69 radio runner (always-listens, arbitrates TX/RX)
@@ -240,6 +276,77 @@ async fn radio_tx_task(stack: Stack<'static>) {
         match stack.send(Address::Broadcast, Flags::None, &payload).await {
             Ok(()) => log::info!("Radio TX: key={} pressed={}", payload[0], payload[1] != 0),
             Err(e) => log::warn!("Radio TX failed: {:?}", e),
+        }
+    }
+}
+
+/// Listens for RSSI reply packets from the receiver and signals the NeoPixel task.
+/// Reply format: [rssi_byte, key_index] where key_index is 0/1 on press, 0xFF on release.
+#[embassy_executor::task]
+async fn radio_rx_task(stack: Stack<'static>) {
+    loop {
+        let packet = stack.recv().await;
+        if packet.data.len() >= 2 {
+            let rssi = packet.data[0] as i8 as i16;
+            let key_reply = packet.data[1];
+            log::info!("Radio RX: RSSI reply = {} dBm, key={}", rssi, key_reply);
+            RSSI_SIGNAL.signal(rssi);
+            // Flash red/blue on key press (0 or 1), skip 0xFF (release)
+            if key_reply <= 1 {
+                KEY_FLASH_SIGNAL.signal(key_reply);
+            }
+        } else if packet.data.len() >= 1 {
+            // Backward compat: 1-byte reply (RSSI only)
+            let rssi = packet.data[0] as i8 as i16;
+            log::info!("Radio RX: RSSI reply = {} dBm", rssi);
+            RSSI_SIGNAL.signal(rssi);
+        }
+    }
+}
+
+/// Maps an RSSI value (in dBm) to a green brightness (0–255).
+/// RFM69 RSSI typically ranges from ~-120 (very weak) to ~-30 (very strong).
+/// We map [-100, -40] dBm → [1, 255], clamping outside that range.
+fn rssi_to_brightness(rssi: i16) -> u8 {
+    let scaled = ((rssi as i32 + 100) * 255 / 60).max(1).min(255);
+    scaled as u8
+}
+
+/// Drives the built-in NeoPixel (GPIO4) to show RF signal strength as
+/// green brightness, based on RSSI replies from the receiver.
+/// Flashes red (key 0) or blue (key 1) briefly when the receiver reports
+/// a key press, then returns to the green RSSI display.
+#[embassy_executor::task]
+async fn neopixel_task(ws2812: &'static mut NeoPixel) {
+    log::info!("NeoPixel RSSI display task started");
+
+    const IDLE_BRIGHTNESS: u8 = 8;
+    let mut current_brightness = IDLE_BRIGHTNESS;
+    ws2812.write_slice(&[RGB8 { r: 0, g: IDLE_BRIGHTNESS, b: 0 }]).await;
+
+    loop {
+        // Wait for either an RSSI update or a key flash event
+        match select(RSSI_SIGNAL.wait(), KEY_FLASH_SIGNAL.wait()).await {
+            Either::First(rssi) => {
+                let brightness = rssi_to_brightness(rssi);
+                if brightness != current_brightness {
+                    current_brightness = brightness;
+                    log::info!("NeoPixel: rssi={} dBm → green={}", rssi, brightness);
+                    ws2812.write_slice(&[RGB8 { r: 0, g: brightness, b: 0 }]).await;
+                }
+            }
+            Either::Second(key) => {
+                // Flash red (key 0) or blue (key 1) for 200ms
+                let color = match key {
+                    0 => RGB8 { r: 255, g: 0, b: 0 },
+                    _ => RGB8 { r: 0, g: 0, b: 255 },
+                };
+                log::info!("NeoPixel: key {} flash", key);
+                ws2812.write_slice(&[color]).await;
+                Timer::after(Duration::from_millis(200)).await;
+                // Restore green RSSI display
+                ws2812.write_slice(&[RGB8 { r: 0, g: current_brightness, b: 0 }]).await;
+            }
         }
     }
 }

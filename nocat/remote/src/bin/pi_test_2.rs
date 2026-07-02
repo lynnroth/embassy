@@ -23,13 +23,14 @@ use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::channel::Channel as SyncChannel;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Delay, Duration, Timer, with_timeout};
+use embassy_time::{Delay, Duration, Timer};
+use embassy_futures::select::{select, Either};
 use embassy_usb::class::cdc_acm::State as CdcState;
 use embassy_usb::class::hid::{
     HidBootProtocol, HidReaderWriter, HidSubclass, State as HidState,
 };
 use embassy_usb::{Builder, Config as UsbConfig, UsbDevice};
-use rfm69_async::{Address, MacTiming, Packet, Rfm69, Runner, Stack, StackResources, Transceiver, TrxError, config};
+use rfm69_async::{Address, Flags, MacTiming, Packet, Rfm69, Runner, Stack, StackResources, Transceiver, TrxError, config};
 use smart_leds::RGB8;
 use static_cell::StaticCell;
 use usbd_hid::descriptor::{KeyboardReport, SerializedDescriptor};
@@ -139,6 +140,9 @@ static STATE_CHANGED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 /// Signal for the latest RSSI reading (dBm) from received radio packets
 static RSSI_SIGNAL: Signal<CriticalSectionRawMutex, i16> = Signal::new();
 
+/// Signal for key flash events (key index 0=red, 1=blue)
+static KEY_FLASH_SIGNAL: Signal<CriticalSectionRawMutex, u8> = Signal::new();
+
 // ─── USB device task ────────────────────────────────────────────────
 #[embassy_executor::task]
 async fn usb_task(mut usb: MyUsbDevice) -> ! {
@@ -170,15 +174,24 @@ async fn radio_rx_task(stack: Stack<'static>) {
                 packet.rssi
             );
             event_sender.send(Events::RadioReceived(key_index, pressed)).await;
-            // Signal RSSI for the NeoPixel display
+            // Signal RSSI for the NeoPixel display and send it back to the sender
             if let Some(rssi) = packet.rssi {
                 RSSI_SIGNAL.signal(rssi);
+                // Reply with [RSSI, key_index] so the sender can display
+                // signal strength AND flash red/blue on key press.
+                // key_index is the actual key on press, 0xFF on release.
+                let rssi_byte = rssi as i8 as u8;
+                let key_reply = if pressed { key_index } else { 0xFF };
+                if let Err(e) = stack.send(packet.src, Flags::None, &[rssi_byte, key_reply]).await {
+                    log::warn!("RSSI reply failed: {:?}", e);
+                }
             }
             // Only tap on press — release events are ignored for HID output.
             // This makes each keypress self-contained: down + up in one shot,
             // so a lost release packet never leaves a key stuck down.
             if pressed {
                 hid_sender.send(key_index).await;
+                KEY_FLASH_SIGNAL.signal(key_index);
             }
         }
     }
@@ -248,23 +261,20 @@ fn rssi_to_brightness(rssi: i16) -> u8 {
 }
 
 /// Drives the built-in NeoPixel (GPIO4) to show RF signal strength as
-/// green brightness. Updates on each received packet; fades to off if
-/// no packets arrive within 3 seconds.
+/// green brightness. Flashes red (key 0) or blue (key 1) briefly when
+/// a key press is received, then returns to the green RSSI display.
 #[embassy_executor::task]
 async fn neopixel_task(ws2812: &'static mut NeoPixel) {
     log::info!("NeoPixel RSSI display task started");
 
-    // Default dim green when no signal has been received yet
     const IDLE_BRIGHTNESS: u8 = 8;
     let mut current_brightness = IDLE_BRIGHTNESS;
-
-    // Start with the LED on (dim)
     ws2812.write_slice(&[RGB8 { r: 0, g: IDLE_BRIGHTNESS, b: 0 }]).await;
 
     loop {
-        // Wait up to 2s for a new RSSI reading
-        match with_timeout(Duration::from_secs(2), RSSI_SIGNAL.wait()).await {
-            Ok(rssi) => {
+        // Wait for either an RSSI update or a key flash event
+        match select(RSSI_SIGNAL.wait(), KEY_FLASH_SIGNAL.wait()).await {
+            Either::First(rssi) => {
                 let brightness = rssi_to_brightness(rssi);
                 if brightness != current_brightness {
                     current_brightness = brightness;
@@ -272,13 +282,17 @@ async fn neopixel_task(ws2812: &'static mut NeoPixel) {
                     ws2812.write_slice(&[RGB8 { r: 0, g: brightness, b: 0 }]).await;
                 }
             }
-            Err(_) => {
-                // No packet in 2s — fade back to idle brightness
-                if current_brightness != IDLE_BRIGHTNESS {
-                    current_brightness = IDLE_BRIGHTNESS;
-                    log::info!("NeoPixel: no signal, fading to idle green={}", IDLE_BRIGHTNESS);
-                    ws2812.write_slice(&[RGB8 { r: 0, g: IDLE_BRIGHTNESS, b: 0 }]).await;
-                }
+            Either::Second(key) => {
+                // Flash red (key 0) or blue (key 1) for 200ms
+                let color = match key {
+                    0 => RGB8 { r: 255, g: 0, b: 0 },
+                    _ => RGB8 { r: 0, g: 0, b: 255 },
+                };
+                log::info!("NeoPixel: key {} flash", key);
+                ws2812.write_slice(&[color]).await;
+                Timer::after(Duration::from_millis(200)).await;
+                // Restore green RSSI display
+                ws2812.write_slice(&[RGB8 { r: 0, g: current_brightness, b: 0 }]).await;
             }
         }
     }

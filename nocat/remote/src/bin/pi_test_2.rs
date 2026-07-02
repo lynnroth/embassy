@@ -10,6 +10,7 @@ use assign_resources::assign_resources;
 use defmt::Format;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
 use embassy_rp::Peri;
 use embassy_rp::bind_interrupts;
 use embassy_rp::dma;
@@ -24,13 +25,12 @@ use embassy_sync::channel::Channel as SyncChannel;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Delay, Duration, Timer};
-use embassy_futures::select::{select, Either};
 use embassy_usb::class::cdc_acm::State as CdcState;
-use embassy_usb::class::hid::{
-    HidBootProtocol, HidReaderWriter, HidSubclass, State as HidState,
-};
+use embassy_usb::class::hid::{HidBootProtocol, HidReaderWriter, HidSubclass, State as HidState};
 use embassy_usb::{Builder, Config as UsbConfig, UsbDevice};
-use rfm69_async::{Address, Flags, MacTiming, Packet, Rfm69, Runner, Stack, StackResources, Transceiver, TrxError, config};
+use rfm69_async::{
+    Address, Flags, MacTiming, Packet, Rfm69, Runner, Stack, StackResources, Transceiver, TrxError, config,
+};
 use smart_leds::RGB8;
 use static_cell::StaticCell;
 use usbd_hid::descriptor::{KeyboardReport, SerializedDescriptor};
@@ -167,12 +167,7 @@ async fn radio_rx_task(stack: Stack<'static>) {
         if packet.data.len() >= 2 {
             let key_index = packet.data[0];
             let pressed = packet.data[1] != 0;
-            log::info!(
-                "Radio RX: key={} pressed={} rssi={:?}",
-                key_index,
-                pressed,
-                packet.rssi
-            );
+            log::info!("Radio RX: key={} pressed={} rssi={:?}", key_index, pressed, packet.rssi);
             event_sender.send(Events::RadioReceived(key_index, pressed)).await;
             // Signal RSSI for the NeoPixel display and send it back to the sender
             if let Some(rssi) = packet.rssi {
@@ -254,9 +249,9 @@ async fn hid_keyboard_task(mut writer: MyHidWriter) {
 // ─── NeoPixel RSSI display task ─────────────────────────────────────
 /// Maps an RSSI value (in dBm) to a green brightness (0–255).
 /// RFM69 RSSI typically ranges from ~-120 (very weak) to ~-30 (very strong).
-/// We map [-100, -40] dBm → [1, 255], clamping outside that range.
+/// We map [-90, -40] dBm → [1, 255], clamping outside that range.
 fn rssi_to_brightness(rssi: i16) -> u8 {
-    let scaled = ((rssi as i32 + 100) * 255 / 60).max(1).min(255);
+    let scaled = ((rssi as i32 + 90) * 255 / 60).max(1).min(255);
     scaled as u8
 }
 
@@ -267,32 +262,50 @@ fn rssi_to_brightness(rssi: i16) -> u8 {
 async fn neopixel_task(ws2812: &'static mut NeoPixel) {
     log::info!("NeoPixel RSSI display task started");
 
-    const IDLE_BRIGHTNESS: u8 = 8;
+    const IDLE_BRIGHTNESS: u8 = 4; // half of sender's 8 for battery saving
     let mut current_brightness = IDLE_BRIGHTNESS;
-    ws2812.write_slice(&[RGB8 { r: 0, g: IDLE_BRIGHTNESS, b: 0 }]).await;
+    ws2812
+        .write_slice(&[RGB8 {
+            r: 0,
+            g: 0,
+            b: IDLE_BRIGHTNESS,
+        }])
+        .await;
 
     loop {
         // Wait for either an RSSI update or a key flash event
         match select(RSSI_SIGNAL.wait(), KEY_FLASH_SIGNAL.wait()).await {
             Either::First(rssi) => {
-                let brightness = rssi_to_brightness(rssi);
+                let brightness = rssi_to_brightness(rssi) / 2; // half brightness for battery
                 if brightness != current_brightness {
                     current_brightness = brightness;
                     log::info!("NeoPixel: rssi={} dBm → green={}", rssi, brightness);
-                    ws2812.write_slice(&[RGB8 { r: 0, g: brightness, b: 0 }]).await;
+                    ws2812
+                        .write_slice(&[RGB8 {
+                            r: 0,
+                            g: 0,
+                            b: brightness,
+                        }])
+                        .await;
                 }
             }
             Either::Second(key) => {
-                // Flash red (key 0) or blue (key 1) for 200ms
+                // Flash red (key 0) or blue (key 1) for 200ms — half brightness
                 let color = match key {
-                    0 => RGB8 { r: 255, g: 0, b: 0 },
-                    _ => RGB8 { r: 0, g: 0, b: 255 },
+                    0 => RGB8 { r: 128, g: 0, b: 0 },
+                    _ => RGB8 { r: 0, g: 128, b: 0 },
                 };
                 log::info!("NeoPixel: key {} flash", key);
                 ws2812.write_slice(&[color]).await;
                 Timer::after(Duration::from_millis(200)).await;
                 // Restore green RSSI display
-                ws2812.write_slice(&[RGB8 { r: 0, g: current_brightness, b: 0 }]).await;
+                ws2812
+                    .write_slice(&[RGB8 {
+                        r: 0,
+                        g: 0,
+                        b: current_brightness,
+                    }])
+                    .await;
             }
         }
     }
@@ -381,11 +394,7 @@ async fn main(spawner: Spawner) {
 
     // CDC ACM class for logging
     static CDC_STATE: StaticCell<CdcState> = StaticCell::new();
-    let cdc_class = embassy_usb::class::cdc_acm::CdcAcmClass::new(
-        &mut builder,
-        CDC_STATE.init(CdcState::new()),
-        64,
-    );
+    let cdc_class = embassy_usb::class::cdc_acm::CdcAcmClass::new(&mut builder, CDC_STATE.init(CdcState::new()), 64);
 
     // HID keyboard class
     static HID_STATE: StaticCell<HidState> = StaticCell::new();
@@ -397,11 +406,7 @@ async fn main(spawner: Spawner) {
         hid_subclass: HidSubclass::Boot,
         hid_boot_protocol: HidBootProtocol::Keyboard,
     };
-    let hid = HidReaderWriter::<_, 1, 8>::new(
-        &mut builder,
-        HID_STATE.init(HidState::new()),
-        hid_config,
-    );
+    let hid = HidReaderWriter::<_, 1, 8>::new(&mut builder, HID_STATE.init(HidState::new()), hid_config);
     let (reader, writer) = hid.split();
 
     // Build the USB device
@@ -433,8 +438,7 @@ async fn main(spawner: Spawner) {
 
     log::info!("RFM69 radio: SPI1 sck=14 mosi=15 miso=8 cs=16 rst=17 dio0=21");
 
-    static SPI_BUS: StaticCell<Mutex<NoopRawMutex, Spi<'static, SPI1, embassy_rp::spi::Async>>> =
-        StaticCell::new();
+    static SPI_BUS: StaticCell<Mutex<NoopRawMutex, Spi<'static, SPI1, embassy_rp::spi::Async>>> = StaticCell::new();
     let spi_bus = SPI_BUS.init(Mutex::new(spi));
 
     let dio0 = Some(embassy_rp::gpio::Input::new(r.radio.dio0, Pull::None));
@@ -461,7 +465,17 @@ async fn main(spawner: Spawner) {
         panic!();
     }
 
-    let trx = RecoveringRadio { rfm, network_id, frequency };
+    // Set TX power to max: RFM69HCW +20 dBm with high-power boost
+    if let Err(e) = rfm.set_tx_power_boost().await {
+        log::error!("Set TX power failed: {:?}", e);
+    }
+    log::info!("TX power set to +20 dBm (PA1+PA2 boost)");
+
+    let trx = RecoveringRadio {
+        rfm,
+        network_id,
+        frequency,
+    };
     let own_address = Address::Unicast(2); // Receiver address (sender is 1)
     static RESOURCES: StaticCell<StackResources> = StaticCell::new();
     let resources = RESOURCES.init(StackResources::new());
@@ -486,14 +500,7 @@ async fn main(spawner: Spawner) {
     let Pio { common, sm0, .. } = Pio::new(p.PIO0, Irqs);
     let common = PIO_COMMON.init(common);
     let ws2812_program = WS2812_PROGRAM.init(PioWs2812Program::new(common));
-    let ws2812 = WS2812.init(PioWs2812::new(
-        common,
-        sm0,
-        p.DMA_CH2,
-        Irqs,
-        p.PIN_4,
-        ws2812_program,
-    ));
+    let ws2812 = WS2812.init(PioWs2812::new(common, sm0, p.DMA_CH2, Irqs, p.PIN_4, ws2812_program));
 
     log::info!("NeoPixel initialized on GPIO4");
 

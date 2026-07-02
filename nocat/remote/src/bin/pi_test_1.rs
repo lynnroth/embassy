@@ -10,6 +10,7 @@ use assign_resources::assign_resources;
 use defmt::Format;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
 use embassy_rp::Peri;
 use embassy_rp::adc::{Adc, Channel as AdcChannel, Config as AdcConfig, InterruptHandler as AdcInterruptHandler};
 use embassy_rp::bind_interrupts;
@@ -21,14 +22,15 @@ use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::pio_programs::ws2812::{Grb, PioWs2812, PioWs2812Program};
 use embassy_rp::spi::{Config as SpiConfig, Spi};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
-use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::Channel as SyncChannel;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Delay, Duration, Timer};
-use embassy_futures::select::{select, Either};
-use rfm69_async::{Address, Flags, MacTiming, Packet, Rfm69, Runner, Stack, StackResources, Transceiver, TrxError, config};
+use embassy_time::{Delay, Duration, Timer, with_timeout};
+use rfm69_async::{
+    Address, Flags, MacTiming, Packet, Rfm69, Runner, Stack, StackResources, Transceiver, TrxError, config,
+};
 use smart_leds::RGB8;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
@@ -177,10 +179,19 @@ async fn main(spawner: Spawner) {
     // CS=GPIO16, RST=GPIO17, DIO0=GPIO21
     let mut spi_cfg = SpiConfig::default();
     spi_cfg.frequency = 8_000_000; // 8 MHz — RFM69 supports up to 10 MHz
-    let mut spi = Spi::new(p.SPI1, r.radio.sck, r.radio.mosi, r.radio.miso, p.DMA_CH0, p.DMA_CH1, Irqs, spi_cfg);
+    let spi = Spi::new(
+        p.SPI1,
+        r.radio.sck,
+        r.radio.mosi,
+        r.radio.miso,
+        p.DMA_CH0,
+        p.DMA_CH1,
+        Irqs,
+        spi_cfg,
+    );
 
-    let mut cs_pin = Output::new(r.radio.cs, Level::High);
-    let mut rst_pin = Output::new(r.radio.reset, Level::Low); // RFM69 reset is active-high; LOW = out of reset
+    let cs_pin = Output::new(r.radio.cs, Level::High);
+    let rst_pin = Output::new(r.radio.reset, Level::Low); // RFM69 reset is active-high; LOW = out of reset
     Timer::after_millis(10).await;
 
     log::info!("RFM69 radio: SPI1 sck=14 mosi=15 miso=8 cs=16 rst=17 dio0=21");
@@ -214,13 +225,27 @@ async fn main(spawner: Spawner) {
         panic!();
     }
 
-    let trx = RecoveringRadio { rfm, network_id, frequency };
+    // Set TX power to max: RFM69HCW +20 dBm with high-power boost
+    if let Err(e) = rfm.set_tx_power_boost().await {
+        log::error!("Set TX power failed: {:?}", e);
+    }
+    log::info!("TX power set to +20 dBm (PA1+PA2 boost)");
+
+    let trx = RecoveringRadio {
+        rfm,
+        network_id,
+        frequency,
+    };
     let own_address = Address::Unicast(1);
     static RESOURCES: StaticCell<StackResources> = StaticCell::new();
     let resources = RESOURCES.init(StackResources::new());
     let (stack, runner) = Stack::new(trx, own_address, resources, MacTiming::default());
 
-    log::info!("RFM69 radio ready, address {:?} freq {} MHz", own_address, frequency / 1_000_000);
+    log::info!(
+        "RFM69 radio ready, address {:?} freq {} MHz",
+        own_address,
+        frequency / 1_000_000
+    );
 
     // ── NeoPixel Setup (GPIO4) ──
     // Built-in NeoPixel on the Feather RP2040 RFM69 — displays signal
@@ -232,14 +257,7 @@ async fn main(spawner: Spawner) {
     let Pio { common, sm0, .. } = Pio::new(p.PIO0, Irqs);
     let common = PIO_COMMON.init(common);
     let ws2812_program = WS2812_PROGRAM.init(PioWs2812Program::new(common));
-    let ws2812 = WS2812.init(PioWs2812::new(
-        common,
-        sm0,
-        p.DMA_CH2,
-        Irqs,
-        p.PIN_4,
-        ws2812_program,
-    ));
+    let ws2812 = WS2812.init(PioWs2812::new(common, sm0, p.DMA_CH2, Irqs, p.PIN_4, ws2812_program));
     log::info!("NeoPixel initialized on GPIO4");
 
     // Spawn orchestrator tasks
@@ -269,9 +287,7 @@ async fn radio_tx_task(stack: Stack<'static>) {
     loop {
         let packet = receiver.receive().await;
         let payload = match packet {
-            RadioPacket::KeyEvent(key, pressed) => {
-                [key, if pressed { 1 } else { 0 }]
-            }
+            RadioPacket::KeyEvent(key, pressed) => [key, if pressed { 1 } else { 0 }],
         };
         match stack.send(Address::Broadcast, Flags::None, &payload).await {
             Ok(()) => log::info!("Radio TX: key={} pressed={}", payload[0], payload[1] != 0),
@@ -306,46 +322,72 @@ async fn radio_rx_task(stack: Stack<'static>) {
 
 /// Maps an RSSI value (in dBm) to a green brightness (0–255).
 /// RFM69 RSSI typically ranges from ~-120 (very weak) to ~-30 (very strong).
-/// We map [-100, -40] dBm → [1, 255], clamping outside that range.
+/// We map [-90, -40] dBm → [1, 255], clamping outside that range.
 fn rssi_to_brightness(rssi: i16) -> u8 {
-    let scaled = ((rssi as i32 + 100) * 255 / 60).max(1).min(255);
+    let scaled = ((rssi as i32 + 90) * 255 / 60).max(1).min(255);
     scaled as u8
 }
 
 /// Drives the built-in NeoPixel (GPIO4) to show RF signal strength as
 /// green brightness, based on RSSI replies from the receiver.
 /// Flashes red (key 0) or blue (key 1) briefly when the receiver reports
-/// a key press, then returns to the green RSSI display.
+/// a key press. Green turns off after 1 second with no signal (battery saving).
 #[embassy_executor::task]
 async fn neopixel_task(ws2812: &'static mut NeoPixel) {
     log::info!("NeoPixel RSSI display task started");
 
-    const IDLE_BRIGHTNESS: u8 = 8;
+    const IDLE_BRIGHTNESS: u8 = 0; // LED off when no signal (battery saving)
     let mut current_brightness = IDLE_BRIGHTNESS;
-    ws2812.write_slice(&[RGB8 { r: 0, g: IDLE_BRIGHTNESS, b: 0 }]).await;
+    let off = [RGB8 { r: 0, g: 0, b: 0 }];
+    ws2812.write_slice(&off).await;
 
     loop {
-        // Wait for either an RSSI update or a key flash event
-        match select(RSSI_SIGNAL.wait(), KEY_FLASH_SIGNAL.wait()).await {
-            Either::First(rssi) => {
+        // Wait for either an RSSI update, a key flash event, or 1s timeout
+        match select(
+            with_timeout(Duration::from_secs(1), RSSI_SIGNAL.wait()),
+            KEY_FLASH_SIGNAL.wait(),
+        )
+        .await
+        {
+            Either::First(Ok(rssi)) => {
                 let brightness = rssi_to_brightness(rssi);
                 if brightness != current_brightness {
                     current_brightness = brightness;
                     log::info!("NeoPixel: rssi={} dBm → green={}", rssi, brightness);
-                    ws2812.write_slice(&[RGB8 { r: 0, g: brightness, b: 0 }]).await;
+                    ws2812
+                        .write_slice(&[RGB8 {
+                            r: 0,
+                            g: 0,
+                            b: brightness,
+                        }])
+                        .await;
+                }
+            }
+            Either::First(Err(_)) => {
+                // No RSSI for 1s — turn off green
+                if current_brightness != 0 {
+                    current_brightness = 0;
+                    log::info!("NeoPixel: no signal, LED off");
+                    ws2812.write_slice(&off).await;
                 }
             }
             Either::Second(key) => {
                 // Flash red (key 0) or blue (key 1) for 200ms
                 let color = match key {
-                    0 => RGB8 { r: 255, g: 0, b: 0 },
-                    _ => RGB8 { r: 0, g: 0, b: 255 },
+                    0 => RGB8 { r: 32, g: 0, b: 0 },
+                    _ => RGB8 { r: 0, g: 32, b: 0 },
                 };
                 log::info!("NeoPixel: key {} flash", key);
                 ws2812.write_slice(&[color]).await;
                 Timer::after(Duration::from_millis(200)).await;
-                // Restore green RSSI display
-                ws2812.write_slice(&[RGB8 { r: 0, g: current_brightness, b: 0 }]).await;
+                // Restore green RSSI display (or off if no recent signal)
+                ws2812
+                    .write_slice(&[RGB8 {
+                        r: 0,
+                        g: 0,
+                        b: current_brightness,
+                    }])
+                    .await;
             }
         }
     }

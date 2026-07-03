@@ -11,7 +11,7 @@ use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_rp::Peri;
-#[cfg(feature = "battery_monitor")]
+#[cfg(not(feature = "no_battery_monitor"))]
 use embassy_rp::adc::{Adc, Channel as AdcChannel, Config as AdcConfig, InterruptHandler as AdcInterruptHandler};
 use embassy_rp::bind_interrupts;
 use embassy_rp::dma;
@@ -34,7 +34,7 @@ use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 // Hardware resource assignment
-#[cfg(feature = "battery_monitor")]
+#[cfg(not(feature = "no_battery_monitor"))]
 assign_resources! {
     keyboard: Keyboard {
         // Feather header D11/D12/D13 — free, not used by RFM69
@@ -62,7 +62,7 @@ assign_resources! {
 }
 
 // Hardware resource assignment (without battery_monitor)
-#[cfg(not(feature = "battery_monitor"))]
+#[cfg(feature = "no_battery_monitor")]
 assign_resources! {
     keyboard: Keyboard {
         row: PIN_11,
@@ -84,7 +84,7 @@ assign_resources! {
 
 // Interrupt bindings
 bind_interrupts!(struct Irqs {
-    #[cfg(feature = "battery_monitor")]
+        #[cfg(not(feature = "no_battery_monitor"))]
     ADC_IRQ_FIFO => AdcInterruptHandler;
     DMA_IRQ_0 => dma::InterruptHandler<peripherals::DMA_CH0>, dma::InterruptHandler<peripherals::DMA_CH1>, dma::InterruptHandler<peripherals::DMA_CH2>;
     PIO0_IRQ_0 => PioInterruptHandler<peripherals::PIO0>;
@@ -114,7 +114,7 @@ enum Events {
 /// Radio-bound packets
 enum RadioPacket {
     KeyEvent(u8, bool),
-    #[cfg(feature = "battery_monitor")]
+        #[cfg(not(feature = "no_battery_monitor"))]
     BatteryLow,
 }
 
@@ -153,7 +153,7 @@ static RSSI_SIGNAL: Signal<CriticalSectionRawMutex, i16> = Signal::new();
 static KEY_FLASH_SIGNAL: Signal<CriticalSectionRawMutex, u8> = Signal::new();
 
 /// Signal for battery low warning (triggered by battery_monitor task)
-#[cfg(feature = "battery_monitor")]
+#[cfg(not(feature = "no_battery_monitor"))]
 static BATTERY_LOW_SIGNAL: Signal<CriticalSectionRawMutex, f32> = Signal::new();
 
 #[embassy_executor::main]
@@ -261,7 +261,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(neopixel_task(ws2812).unwrap());
 
     // Spawn battery monitor task (only with battery_monitor feature)
-    #[cfg(feature = "battery_monitor")]
+        #[cfg(not(feature = "no_battery_monitor"))]
     {
         spawner.spawn(battery_monitor_task(r.battery).unwrap());
     }
@@ -279,14 +279,14 @@ async fn radio_task(mut rfm: RadioDriver, own_address: Address) {
         let packet = receiver.receive().await;
         let payload = match packet {
             RadioPacket::KeyEvent(key, pressed) => [key, if pressed { 1 } else { 0 }],
-            #[cfg(feature = "battery_monitor")]
+                        #[cfg(not(feature = "no_battery_monitor"))]
             RadioPacket::BatteryLow => [0xFF, 0xFF], // battery-low marker
         };
 
         // Wake radio and send
         let tx_packet = Packet::new(own_address, Address::Broadcast, Flags::None, &payload).unwrap();
 
-        #[cfg(feature = "battery_monitor")]
+                #[cfg(not(feature = "no_battery_monitor"))]
         match &packet {
             RadioPacket::KeyEvent(key, pressed) => {
                 match rfm.send(&tx_packet).await {
@@ -301,7 +301,7 @@ async fn radio_task(mut rfm: RadioDriver, own_address: Address) {
                 }
             }
         }
-        #[cfg(not(feature = "battery_monitor"))]
+        #[cfg(feature = "no_battery_monitor")]
         match rfm.send(&tx_packet).await {
             Ok(()) => log::info!("Radio TX: key={} pressed={}", payload[0], payload[1] != 0),
             Err(e) => log::warn!("Radio TX failed: {:?}", e),
@@ -350,7 +350,7 @@ async fn neopixel_task(ws2812: &'static mut NeoPixel) {
 
     loop {
         // Check for battery low warning first (highest priority)
-        #[cfg(feature = "battery_monitor")]
+                #[cfg(not(feature = "no_battery_monitor"))]
         if let Some(voltage) = BATTERY_LOW_SIGNAL.try_take() {
             log::warn!("NeoPixel: battery low warning ({:.2} V), flashing red until cleared", voltage);
             let red = RGB8 { r: 32, g: 0, b: 0 };
@@ -533,13 +533,13 @@ async fn consumer(_spawner: Spawner) {
 // Checks battery every 60 seconds. If ≤ 3.2V:
 // - Signals the local NeoPixel task to flash red
 // - Sends a battery-low alert over radio to the receiver
-#[cfg(feature = "battery_monitor")]
+#[cfg(not(feature = "no_battery_monitor"))]
 const BATTERY_LOW_THRESHOLD: f32 = 3.2;
 
-#[cfg(feature = "battery_monitor")]
+#[cfg(not(feature = "no_battery_monitor"))]
 const BATTERY_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
-#[cfg(feature = "battery_monitor")]
+#[cfg(not(feature = "no_battery_monitor"))]
 #[embassy_executor::task]
 async fn battery_monitor_task(r: Battery) {
     let mut adc = Adc::new(r.adc, Irqs, AdcConfig::default());

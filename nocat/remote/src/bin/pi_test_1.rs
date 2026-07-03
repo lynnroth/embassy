@@ -43,10 +43,10 @@ assign_resources! {
         col1: PIN_13,
     },
     battery: Battery {
-        // GPIO26 reads VBAT/2 via external 100K/100K divider
+        // GPIO27 reads VBAT/2 via external 100K/100K divider
         // (requires external resistors — enable with `battery_monitor` feature)
         adc: ADC,
-        pin: PIN_26,
+        pin: PIN_27,
     },
     radio: Radio {
         // Feather RP2040 RFM69 — SPI1 bus per Adafruit board definition
@@ -114,7 +114,7 @@ enum Events {
 /// Radio-bound packets
 enum RadioPacket {
     KeyEvent(u8, bool),
-        #[cfg(not(feature = "no_battery_monitor"))]
+    #[cfg(not(feature = "no_battery_monitor"))]
     BatteryLow,
 }
 
@@ -239,17 +239,17 @@ async fn main(spawner: Spawner) {
     let ws2812 = WS2812.init(PioWs2812::new(common, sm0, p.DMA_CH2, Irqs, p.PIN_4, ws2812_program));
     log::info!("NeoPixel initialized on GPIO4");
 
-    // ── Sender address jumper (GPIO27) ──
-    // If GPIO27 is pulled high (jumper to 3.3V), use address 3.
+    // ── Sender address jumper (GPIO28) ──
+    // If GPIO28 is pulled high (jumper to 3.3V), use address 3.
     // If left unconnected (internal pull-down), use default address 1.
     // This allows two senders to coexist without recompiling.
-    let addr_jumper = Input::new(p.PIN_27, Pull::Down);
+    let addr_jumper = Input::new(p.PIN_28, Pull::Down);
     let own_address = if addr_jumper.is_high() {
         Address::Unicast(3)
     } else {
         Address::Unicast(1)
     };
-    log::info!("Sender address: {:?} (GPIO27={})", own_address, addr_jumper.is_high());
+    log::info!("Sender address: {:?} (GPIO28={})", own_address, addr_jumper.is_high());
 
     // Spawn orchestrator tasks
     spawner.spawn(orchestrate(spawner).unwrap());
@@ -261,7 +261,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(neopixel_task(ws2812).unwrap());
 
     // Spawn battery monitor task (only with battery_monitor feature)
-        #[cfg(not(feature = "no_battery_monitor"))]
+    #[cfg(not(feature = "no_battery_monitor"))]
     {
         spawner.spawn(battery_monitor_task(r.battery).unwrap());
     }
@@ -279,27 +279,23 @@ async fn radio_task(mut rfm: RadioDriver, own_address: Address) {
         let packet = receiver.receive().await;
         let payload = match packet {
             RadioPacket::KeyEvent(key, pressed) => [key, if pressed { 1 } else { 0 }],
-                        #[cfg(not(feature = "no_battery_monitor"))]
+            #[cfg(not(feature = "no_battery_monitor"))]
             RadioPacket::BatteryLow => [0xFF, 0xFF], // battery-low marker
         };
 
         // Wake radio and send
         let tx_packet = Packet::new(own_address, Address::Broadcast, Flags::None, &payload).unwrap();
 
-                #[cfg(not(feature = "no_battery_monitor"))]
+        #[cfg(not(feature = "no_battery_monitor"))]
         match &packet {
-            RadioPacket::KeyEvent(key, pressed) => {
-                match rfm.send(&tx_packet).await {
-                    Ok(()) => log::info!("Radio TX: key={} pressed={}", key, pressed),
-                    Err(e) => log::warn!("Radio TX failed: {:?}", e),
-                }
-            }
-            RadioPacket::BatteryLow => {
-                match rfm.send(&tx_packet).await {
-                    Ok(()) => log::warn!("Radio TX: battery low alert sent"),
-                    Err(e) => log::warn!("Radio TX failed: {:?}", e),
-                }
-            }
+            RadioPacket::KeyEvent(key, pressed) => match rfm.send(&tx_packet).await {
+                Ok(()) => log::info!("Radio TX: key={} pressed={}", key, pressed),
+                Err(e) => log::warn!("Radio TX failed: {:?}", e),
+            },
+            RadioPacket::BatteryLow => match rfm.send(&tx_packet).await {
+                Ok(()) => log::warn!("Radio TX: battery low alert sent"),
+                Err(e) => log::warn!("Radio TX failed: {:?}", e),
+            },
         }
         #[cfg(feature = "no_battery_monitor")]
         match rfm.send(&tx_packet).await {
@@ -350,11 +346,14 @@ async fn neopixel_task(ws2812: &'static mut NeoPixel) {
 
     loop {
         // Check for battery low warning first (highest priority)
-                #[cfg(not(feature = "no_battery_monitor"))]
+        #[cfg(not(feature = "no_battery_monitor"))]
         if let Some(voltage) = BATTERY_LOW_SIGNAL.try_take() {
-            log::warn!("NeoPixel: battery low warning ({:.2} V), flashing red until cleared", voltage);
+            log::warn!(
+                "NeoPixel: battery low warning ({:.2} V), flashing red until cleared",
+                voltage
+            );
             let red = RGB8 { r: 32, g: 0, b: 0 };
-            let key0_color = RGB8 { r: 32, g: 0, b: 0 };  // red (same as battery)
+            let key0_color = RGB8 { r: 32, g: 0, b: 0 }; // red (same as battery)
             let key1_color = RGB8 { r: 0, g: 32, b: 0 }; // green
 
             let mut last_alert = embassy_time::Instant::now();
@@ -526,9 +525,9 @@ async fn consumer(_spawner: Spawner) {
     }
 }
 
-// ─── Battery monitoring (requires external 100K/100K divider on GPIO26) ───
-// Hardware: VBAT ---[100K]--- GPIO26 ---[100K]--- GND
-// This gives VBAT/2 at GPIO26. Enable with `--features battery_monitor`.
+// ─── Battery monitoring (external 100K/100K divider on GPIO27) ───
+// Hardware: VBAT ---[100K]--- GPIO27 ---[100K]--- GND
+// This gives VBAT/2 at GPIO27.
 //
 // Checks battery every 60 seconds. If ≤ 3.2V:
 // - Signals the local NeoPixel task to flash red
@@ -543,16 +542,14 @@ const BATTERY_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 #[embassy_executor::task]
 async fn battery_monitor_task(r: Battery) {
     let mut adc = Adc::new(r.adc, Irqs, AdcConfig::default());
-    let mut channel = AdcChannel::new_pin(r.pin, Pull::Down);
+    let mut channel = AdcChannel::new_pin(r.pin, Pull::None);
 
     log::info!(
-        "Battery monitor started on GPIO26 (threshold: {} V)",
+        "Battery monitor started on GPIO27 (threshold: {} V)",
         BATTERY_LOW_THRESHOLD
     );
 
     loop {
-        Timer::after(BATTERY_CHECK_INTERVAL).await;
-
         let adc_value = match adc.read(&mut channel).await {
             Ok(v) => v,
             Err(e) => {
@@ -561,7 +558,7 @@ async fn battery_monitor_task(r: Battery) {
             }
         };
 
-        // GPIO26 reads VBAT/2 through the 100K/100K divider.
+        // GPIO27 reads VBAT/2 through the 100K/100K divider.
         // voltage = adc_value * 3.3 * 2.0 / 4096.0
         let voltage = (adc_value as f32) * 3.3 * 2.0 / 4096.0;
         log::info!("Battery: {:.2} V (adc={})", voltage, adc_value);
@@ -574,5 +571,8 @@ async fn battery_monitor_task(r: Battery) {
             let radio_sender = RADIO_CHANNEL.sender();
             radio_sender.send(RadioPacket::BatteryLow).await;
         }
+
+        // Wait before next check
+        Timer::after(BATTERY_CHECK_INTERVAL).await;
     }
 }

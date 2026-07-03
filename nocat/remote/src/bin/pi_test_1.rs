@@ -7,7 +7,6 @@
 #![no_main]
 
 use assign_resources::assign_resources;
-use defmt::Format;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
@@ -86,7 +85,7 @@ enum RadioPacket {
 }
 
 /// The central state of our system, shared between tasks.
-#[derive(Clone, Format)]
+#[derive(Clone)]
 struct State {
     key0_pressed: bool,
     key1_pressed: bool,
@@ -105,10 +104,10 @@ impl State {
 static SYSTEM_STATE: Mutex<CriticalSectionRawMutex, State> = Mutex::new(State::new());
 
 /// Channel for events from worker tasks to the orchestrator
-static EVENT_CHANNEL: SyncChannel<CriticalSectionRawMutex, Events, 10> = SyncChannel::new();
+static EVENT_CHANNEL: SyncChannel<CriticalSectionRawMutex, Events, 4> = SyncChannel::new();
 
 /// Channel for radio-bound packets
-static RADIO_CHANNEL: SyncChannel<CriticalSectionRawMutex, RadioPacket, 10> = SyncChannel::new();
+static RADIO_CHANNEL: SyncChannel<CriticalSectionRawMutex, RadioPacket, 4> = SyncChannel::new();
 
 /// Signal for notifying about state changes
 static STATE_CHANGED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
@@ -217,7 +216,6 @@ async fn main(spawner: Spawner) {
 /// then back to sleep.
 #[embassy_executor::task]
 async fn radio_task(mut rfm: RadioDriver) {
-    log::info!("Radio task started");
     let receiver = RADIO_CHANNEL.receiver();
     let own_address = Address::Unicast(1);
 
@@ -256,7 +254,7 @@ async fn radio_task(mut rfm: RadioDriver) {
                 }
             }
             Ok(Err(e)) => log::warn!("Radio RX error: {:?}", e),
-            Err(_) => log::info!("Radio RX: no reply (timeout)"),
+            Err(_) => {}, // no reply within 500ms — radio goes back to sleep
         }
 
         // Back to sleep
@@ -278,7 +276,6 @@ fn rssi_to_brightness(rssi: i16) -> u8 {
 /// a key press. Green turns off after 1 second with no signal (battery saving).
 #[embassy_executor::task]
 async fn neopixel_task(ws2812: &'static mut NeoPixel) {
-    log::info!("NeoPixel RSSI display task started");
 
     const IDLE_BRIGHTNESS: u8 = 0; // LED off when no signal (battery saving)
     let mut current_brightness = IDLE_BRIGHTNESS;
@@ -297,7 +294,6 @@ async fn neopixel_task(ws2812: &'static mut NeoPixel) {
                 let brightness = rssi_to_brightness(rssi);
                 if brightness != current_brightness {
                     current_brightness = brightness;
-                    log::info!("NeoPixel: rssi={} dBm → green={}", rssi, brightness);
                     ws2812
                         .write_slice(&[RGB8 {
                             r: 0,
@@ -311,7 +307,6 @@ async fn neopixel_task(ws2812: &'static mut NeoPixel) {
                 // No RSSI for 1s — turn off green
                 if current_brightness != 0 {
                     current_brightness = 0;
-                    log::info!("NeoPixel: no signal, LED off");
                     ws2812.write_slice(&off).await;
                 }
             }
@@ -321,7 +316,6 @@ async fn neopixel_task(ws2812: &'static mut NeoPixel) {
                     0 => RGB8 { r: 32, g: 0, b: 0 },
                     _ => RGB8 { r: 0, g: 32, b: 0 },
                 };
-                log::info!("NeoPixel: key {} flash", key);
                 ws2812.write_slice(&[color]).await;
                 Timer::after(Duration::from_millis(200)).await;
                 // Restore green RSSI display (or off if no recent signal)
@@ -396,7 +390,6 @@ async fn orchestrate(_spawner: Spawner) {
 
             match event {
                 Events::KeyPressed(key, pressed) => {
-                    log::info!("Key {} {}", key, if pressed { "pressed" } else { "released" });
                     match key {
                         0 => state.key0_pressed = pressed,
                         1 => state.key1_pressed = pressed,
@@ -415,12 +408,8 @@ async fn orchestrate(_spawner: Spawner) {
 async fn consumer(_spawner: Spawner) {
     loop {
         STATE_CHANGED.wait().await;
-
-        let state = SYSTEM_STATE.lock().await;
-        log::info!(
-            "State: keys={} {}",
-            state.key0_pressed,
-            state.key1_pressed
-        );
+        // State is tracked internally; no logging needed here since
+        // keyboard_scanner already logs each key event.
+        let _ = SYSTEM_STATE.lock().await;
     }
 }

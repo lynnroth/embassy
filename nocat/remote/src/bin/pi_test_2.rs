@@ -143,6 +143,9 @@ static RSSI_SIGNAL: Signal<CriticalSectionRawMutex, i16> = Signal::new();
 /// Signal for key flash events (key index 0=red, 1=blue)
 static KEY_FLASH_SIGNAL: Signal<CriticalSectionRawMutex, u8> = Signal::new();
 
+/// Signal for battery low warning from sender
+static BATTERY_LOW_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
 // ─── USB device task ────────────────────────────────────────────────
 #[embassy_executor::task]
 async fn usb_task(mut usb: MyUsbDevice) -> ! {
@@ -165,6 +168,13 @@ async fn radio_rx_task(stack: Stack<'static>) {
     loop {
         let packet = stack.recv().await;
         if packet.data.len() >= 2 {
+            // Check for battery-low marker [0xFF, 0xFF]
+            if packet.data[0] == 0xFF && packet.data[1] == 0xFF {
+                log::warn!("Radio RX: battery low alert from sender");
+                BATTERY_LOW_SIGNAL.signal(());
+                continue;
+            }
+
             let key_index = packet.data[0];
             let pressed = packet.data[1] != 0;
             log::info!("Radio RX: key={} pressed={} rssi={:?}", key_index, pressed, packet.rssi);
@@ -273,6 +283,50 @@ async fn neopixel_task(ws2812: &'static mut NeoPixel) {
         .await;
 
     loop {
+        // Check for battery low warning first (highest priority)
+        if BATTERY_LOW_SIGNAL.try_take().is_some() {
+            log::warn!("NeoPixel: battery low warning, flashing red until cleared");
+            let red = RGB8 { r: 128, g: 0, b: 0 };
+            let off = RGB8 { r: 0, g: 0, b: 0 };
+            let key0_color = RGB8 { r: 128, g: 0, b: 0 };  // red (same as battery)
+            let key1_color = RGB8 { r: 0, g: 128, b: 0 }; // green
+
+            let mut last_alert = embassy_time::Instant::now();
+
+            // Keep flashing continuously. Stop only after 90s with no
+            // battery low alert from the sender.
+            loop {
+                // Check for new battery low alert (non-blocking)
+                if BATTERY_LOW_SIGNAL.try_take().is_some() {
+                    last_alert = embassy_time::Instant::now();
+                }
+
+                // Check for key flash (non-blocking, overrides red for 200ms)
+                if let Some(key) = KEY_FLASH_SIGNAL.try_take() {
+                    let color = if key == 0 { key0_color } else { key1_color };
+                    ws2812.write_slice(&[color]).await;
+                    Timer::after(Duration::from_millis(200)).await;
+                }
+
+                ws2812.write_slice(&[red]).await;
+                Timer::after(Duration::from_millis(300)).await;
+                ws2812.write_slice(&[off]).await;
+                Timer::after(Duration::from_millis(300)).await;
+
+                // Stop if no battery low alert for 90s
+                if last_alert.elapsed() > Duration::from_secs(90) {
+                    log::info!("NeoPixel: battery low cleared");
+                    break;
+                }
+            }
+
+            // Restore previous state
+            ws2812
+                .write_slice(&[RGB8 { r: 0, g: 0, b: current_brightness }])
+                .await;
+            continue;
+        }
+
         // Wait for either an RSSI update or a key flash event
         match select(RSSI_SIGNAL.wait(), KEY_FLASH_SIGNAL.wait()).await {
             Either::First(rssi) => {

@@ -11,9 +11,11 @@ use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_rp::Peri;
+#[cfg(feature = "battery_monitor")]
+use embassy_rp::adc::{Adc, Channel as AdcChannel, Config as AdcConfig, InterruptHandler as AdcInterruptHandler};
 use embassy_rp::bind_interrupts;
 use embassy_rp::dma;
-use embassy_rp::gpio::{Flex, Level, Output, Pull};
+use embassy_rp::gpio::{Flex, Input, Level, Output, Pull};
 use embassy_rp::peripherals::{self, PIO0, SPI1, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::pio_programs::ws2812::{Grb, PioWs2812, PioWs2812Program};
@@ -25,16 +27,44 @@ use embassy_sync::channel::Channel as SyncChannel;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Delay, Duration, Timer, with_timeout};
-use rfm69_async::{Address, Flags, Packet, Rfm69, config};
 use rfm69_async::registers::OpMode;
+use rfm69_async::{Address, Flags, Packet, Rfm69, config};
 use smart_leds::RGB8;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 // Hardware resource assignment
+#[cfg(feature = "battery_monitor")]
 assign_resources! {
     keyboard: Keyboard {
         // Feather header D11/D12/D13 — free, not used by RFM69
+        row: PIN_11,
+        col0: PIN_12,
+        col1: PIN_13,
+    },
+    battery: Battery {
+        // GPIO26 reads VBAT/2 via external 100K/100K divider
+        // (requires external resistors — enable with `battery_monitor` feature)
+        adc: ADC,
+        pin: PIN_26,
+    },
+    radio: Radio {
+        // Feather RP2040 RFM69 — SPI1 bus per Adafruit board definition
+        // SCK=GPIO14, MOSI=GPIO15, MISO=GPIO8
+        // CS=GPIO16, RST=GPIO17, DIO0=GPIO21
+        sck: PIN_14,
+        mosi: PIN_15,
+        miso: PIN_8,
+        cs: PIN_16,
+        reset: PIN_17,
+        dio0: PIN_21,
+    },
+}
+
+// Hardware resource assignment (without battery_monitor)
+#[cfg(not(feature = "battery_monitor"))]
+assign_resources! {
+    keyboard: Keyboard {
         row: PIN_11,
         col0: PIN_12,
         col1: PIN_13,
@@ -54,6 +84,8 @@ assign_resources! {
 
 // Interrupt bindings
 bind_interrupts!(struct Irqs {
+    #[cfg(feature = "battery_monitor")]
+    ADC_IRQ_FIFO => AdcInterruptHandler;
     DMA_IRQ_0 => dma::InterruptHandler<peripherals::DMA_CH0>, dma::InterruptHandler<peripherals::DMA_CH1>, dma::InterruptHandler<peripherals::DMA_CH2>;
     PIO0_IRQ_0 => PioInterruptHandler<peripherals::PIO0>;
 });
@@ -82,6 +114,8 @@ enum Events {
 /// Radio-bound packets
 enum RadioPacket {
     KeyEvent(u8, bool),
+    #[cfg(feature = "battery_monitor")]
+    BatteryLow,
 }
 
 /// The central state of our system, shared between tasks.
@@ -117,6 +151,10 @@ static RSSI_SIGNAL: Signal<CriticalSectionRawMutex, i16> = Signal::new();
 
 /// Signal for key flash events (key index 0=red, 1=blue)
 static KEY_FLASH_SIGNAL: Signal<CriticalSectionRawMutex, u8> = Signal::new();
+
+/// Signal for battery low warning (triggered by battery_monitor task)
+#[cfg(feature = "battery_monitor")]
+static BATTERY_LOW_SIGNAL: Signal<CriticalSectionRawMutex, f32> = Signal::new();
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -201,40 +239,69 @@ async fn main(spawner: Spawner) {
     let ws2812 = WS2812.init(PioWs2812::new(common, sm0, p.DMA_CH2, Irqs, p.PIN_4, ws2812_program));
     log::info!("NeoPixel initialized on GPIO4");
 
+    // ── Sender address jumper (GPIO27) ──
+    // If GPIO27 is pulled high (jumper to 3.3V), use address 3.
+    // If left unconnected (internal pull-down), use default address 1.
+    // This allows two senders to coexist without recompiling.
+    let addr_jumper = Input::new(p.PIN_27, Pull::Down);
+    let own_address = if addr_jumper.is_high() {
+        Address::Unicast(3)
+    } else {
+        Address::Unicast(1)
+    };
+    log::info!("Sender address: {:?} (GPIO27={})", own_address, addr_jumper.is_high());
+
     // Spawn orchestrator tasks
     spawner.spawn(orchestrate(spawner).unwrap());
     spawner.spawn(consumer(spawner).unwrap());
     spawner.spawn(keyboard_scanner(spawner, r.keyboard).unwrap());
 
     // Spawn radio task (sleeps between key presses for power saving)
-    spawner.spawn(radio_task(rfm).unwrap());
+    spawner.spawn(radio_task(rfm, own_address).unwrap());
     spawner.spawn(neopixel_task(ws2812).unwrap());
+
+    // Spawn battery monitor task (only with battery_monitor feature)
+    #[cfg(feature = "battery_monitor")]
+    {
+        spawner.spawn(battery_monitor_task(r.battery).unwrap());
+    }
 }
 
 /// Radio task: sleeps the RFM69 between key presses to save ~16mA.
 /// On key press: wakes radio, TX the key event, briefly RX for RSSI reply,
-/// then back to sleep.
+/// then back to sleep. Also handles battery-low alerts.
 #[embassy_executor::task]
-async fn radio_task(mut rfm: RadioDriver) {
+async fn radio_task(mut rfm: RadioDriver, own_address: Address) {
     let receiver = RADIO_CHANNEL.receiver();
-    let own_address = Address::Unicast(1);
 
     loop {
-        // Radio sleeps while waiting for key events (~0.1µA vs ~16mA in RX)
+        // Radio sleeps while waiting for events (~0.1µA vs ~16mA in RX)
         let packet = receiver.receive().await;
         let payload = match packet {
             RadioPacket::KeyEvent(key, pressed) => [key, if pressed { 1 } else { 0 }],
+            #[cfg(feature = "battery_monitor")]
+            RadioPacket::BatteryLow => [0xFF, 0xFF], // battery-low marker
         };
 
-        // Wake radio and send key event
-        let tx_packet = Packet::new(
-            own_address,
-            Address::Broadcast,
-            Flags::None,
-            &payload,
-        )
-        .unwrap();
+        // Wake radio and send
+        let tx_packet = Packet::new(own_address, Address::Broadcast, Flags::None, &payload).unwrap();
 
+        #[cfg(feature = "battery_monitor")]
+        match &packet {
+            RadioPacket::KeyEvent(key, pressed) => {
+                match rfm.send(&tx_packet).await {
+                    Ok(()) => log::info!("Radio TX: key={} pressed={}", key, pressed),
+                    Err(e) => log::warn!("Radio TX failed: {:?}", e),
+                }
+            }
+            RadioPacket::BatteryLow => {
+                match rfm.send(&tx_packet).await {
+                    Ok(()) => log::warn!("Radio TX: battery low alert sent"),
+                    Err(e) => log::warn!("Radio TX failed: {:?}", e),
+                }
+            }
+        }
+        #[cfg(not(feature = "battery_monitor"))]
         match rfm.send(&tx_packet).await {
             Ok(()) => log::info!("Radio TX: key={} pressed={}", payload[0], payload[1] != 0),
             Err(e) => log::warn!("Radio TX failed: {:?}", e),
@@ -254,7 +321,7 @@ async fn radio_task(mut rfm: RadioDriver) {
                 }
             }
             Ok(Err(e)) => log::warn!("Radio RX error: {:?}", e),
-            Err(_) => {}, // no reply within 500ms — radio goes back to sleep
+            Err(_) => {} // no reply within 500ms — radio goes back to sleep
         }
 
         // Back to sleep
@@ -276,13 +343,60 @@ fn rssi_to_brightness(rssi: i16) -> u8 {
 /// a key press. Green turns off after 1 second with no signal (battery saving).
 #[embassy_executor::task]
 async fn neopixel_task(ws2812: &'static mut NeoPixel) {
-
     const IDLE_BRIGHTNESS: u8 = 0; // LED off when no signal (battery saving)
     let mut current_brightness = IDLE_BRIGHTNESS;
     let off = [RGB8 { r: 0, g: 0, b: 0 }];
     ws2812.write_slice(&off).await;
 
     loop {
+        // Check for battery low warning first (highest priority)
+        #[cfg(feature = "battery_monitor")]
+        if let Some(voltage) = BATTERY_LOW_SIGNAL.try_take() {
+            log::warn!("NeoPixel: battery low warning ({:.2} V), flashing red until cleared", voltage);
+            let red = RGB8 { r: 32, g: 0, b: 0 };
+            let key0_color = RGB8 { r: 32, g: 0, b: 0 };  // red (same as battery)
+            let key1_color = RGB8 { r: 0, g: 32, b: 0 }; // green
+
+            let mut last_alert = embassy_time::Instant::now();
+
+            // Keep flashing continuously. Stop only after 90s with no
+            // battery low alert from the monitor task.
+            loop {
+                // Check for new battery low alert (non-blocking)
+                if BATTERY_LOW_SIGNAL.try_take().is_some() {
+                    last_alert = embassy_time::Instant::now();
+                }
+
+                // Check for key flash (non-blocking, overrides red for 200ms)
+                if let Some(key) = KEY_FLASH_SIGNAL.try_take() {
+                    let color = if key == 0 { key0_color } else { key1_color };
+                    ws2812.write_slice(&[color]).await;
+                    Timer::after(Duration::from_millis(200)).await;
+                }
+
+                ws2812.write_slice(&[red]).await;
+                Timer::after(Duration::from_millis(300)).await;
+                ws2812.write_slice(&off).await;
+                Timer::after(Duration::from_millis(300)).await;
+
+                // Stop if no battery low alert for 90s
+                if last_alert.elapsed() > Duration::from_secs(90) {
+                    log::info!("NeoPixel: battery low cleared");
+                    break;
+                }
+            }
+
+            // Restore previous state
+            ws2812
+                .write_slice(&[RGB8 {
+                    r: 0,
+                    g: 0,
+                    b: current_brightness,
+                }])
+                .await;
+            continue;
+        }
+
         // Wait for either an RSSI update, a key flash event, or 1s timeout
         match select(
             with_timeout(Duration::from_secs(1), RSSI_SIGNAL.wait()),
@@ -389,13 +503,11 @@ async fn orchestrate(_spawner: Spawner) {
             let mut state = SYSTEM_STATE.lock().await;
 
             match event {
-                Events::KeyPressed(key, pressed) => {
-                    match key {
-                        0 => state.key0_pressed = pressed,
-                        1 => state.key1_pressed = pressed,
-                        _ => {}
-                    }
-                }
+                Events::KeyPressed(key, pressed) => match key {
+                    0 => state.key0_pressed = pressed,
+                    1 => state.key1_pressed = pressed,
+                    _ => {}
+                },
             }
         }
 
@@ -411,5 +523,56 @@ async fn consumer(_spawner: Spawner) {
         // State is tracked internally; no logging needed here since
         // keyboard_scanner already logs each key event.
         let _ = SYSTEM_STATE.lock().await;
+    }
+}
+
+// ─── Battery monitoring (requires external 100K/100K divider on GPIO26) ───
+// Hardware: VBAT ---[100K]--- GPIO26 ---[100K]--- GND
+// This gives VBAT/2 at GPIO26. Enable with `--features battery_monitor`.
+//
+// Checks battery every 60 seconds. If ≤ 3.2V:
+// - Signals the local NeoPixel task to flash red
+// - Sends a battery-low alert over radio to the receiver
+#[cfg(feature = "battery_monitor")]
+const BATTERY_LOW_THRESHOLD: f32 = 3.2;
+
+#[cfg(feature = "battery_monitor")]
+const BATTERY_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+#[cfg(feature = "battery_monitor")]
+#[embassy_executor::task]
+async fn battery_monitor_task(r: Battery) {
+    let mut adc = Adc::new(r.adc, Irqs, AdcConfig::default());
+    let mut channel = AdcChannel::new_pin(r.pin, Pull::Down);
+
+    log::info!(
+        "Battery monitor started on GPIO26 (threshold: {} V)",
+        BATTERY_LOW_THRESHOLD
+    );
+
+    loop {
+        Timer::after(BATTERY_CHECK_INTERVAL).await;
+
+        let adc_value = match adc.read(&mut channel).await {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("Battery ADC read failed: {:?}", e);
+                continue;
+            }
+        };
+
+        // GPIO26 reads VBAT/2 through the 100K/100K divider.
+        // voltage = adc_value * 3.3 * 2.0 / 4096.0
+        let voltage = (adc_value as f32) * 3.3 * 2.0 / 4096.0;
+        log::info!("Battery: {:.2} V (adc={})", voltage, adc_value);
+
+        if voltage <= BATTERY_LOW_THRESHOLD {
+            log::warn!("Battery LOW: {:.2} V ≤ {} V", voltage, BATTERY_LOW_THRESHOLD);
+            // Flash local NeoPixel
+            BATTERY_LOW_SIGNAL.signal(voltage);
+            // Send battery-low alert to receiver over radio
+            let radio_sender = RADIO_CHANNEL.sender();
+            radio_sender.send(RadioPacket::BatteryLow).await;
+        }
     }
 }

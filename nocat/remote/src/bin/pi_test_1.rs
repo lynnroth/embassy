@@ -116,6 +116,8 @@ enum RadioPacket {
     KeyEvent(u8, bool),
     #[cfg(not(feature = "no_battery_monitor"))]
     BatteryLow,
+    #[allow(dead_code)]
+    Boot,
 }
 
 /// The central state of our system, shared between tasks.
@@ -251,6 +253,25 @@ async fn main(spawner: Spawner) {
     };
     log::info!("Sender address: {:?} (GPIO28={})", own_address, addr_jumper.is_high());
 
+    // Send boot announcement to receiver so it flashes blue.
+    // Retry a few times with delays in case the receiver isn't listening yet.
+    {
+        let boot_packet = Packet::new(
+            own_address,
+            Address::Broadcast,
+            Flags::None,
+            &[0xFE, 0xFE], // boot marker
+        )
+        .unwrap();
+
+        match rfm.send(&boot_packet).await {
+            Ok(()) => log::info!("Boot announcement sent"),
+            Err(e) => log::warn!("Boot announcement failed: {:?}", e),
+        }
+        rfm.set_mode(OpMode::Sleep).await.ok();
+        Timer::after(Duration::from_secs(2)).await;
+    }
+
     // Spawn orchestrator tasks
     spawner.spawn(orchestrate(spawner).unwrap());
     spawner.spawn(consumer(spawner).unwrap());
@@ -281,6 +302,7 @@ async fn radio_task(mut rfm: RadioDriver, own_address: Address) {
             RadioPacket::KeyEvent(key, pressed) => [key, if pressed { 1 } else { 0 }],
             #[cfg(not(feature = "no_battery_monitor"))]
             RadioPacket::BatteryLow => [0xFF, 0xFF], // battery-low marker
+            RadioPacket::Boot => [0xFE, 0xFE], // boot marker (unused via channel)
         };
 
         // Wake radio and send
@@ -296,11 +318,15 @@ async fn radio_task(mut rfm: RadioDriver, own_address: Address) {
                 Ok(()) => log::warn!("Radio TX: battery low alert sent"),
                 Err(e) => log::warn!("Radio TX failed: {:?}", e),
             },
+            RadioPacket::Boot => {} // handled in main(), never via channel
         }
         #[cfg(feature = "no_battery_monitor")]
-        match rfm.send(&tx_packet).await {
-            Ok(()) => log::info!("Radio TX: key={} pressed={}", payload[0], payload[1] != 0),
-            Err(e) => log::warn!("Radio TX failed: {:?}", e),
+        match &packet {
+            RadioPacket::KeyEvent(key, pressed) => match rfm.send(&tx_packet).await {
+                Ok(()) => log::info!("Radio TX: key={} pressed={}", key, pressed),
+                Err(e) => log::warn!("Radio TX failed: {:?}", e),
+            },
+            RadioPacket::Boot => {} // handled in main(), never via channel
         }
 
         // Briefly listen for RSSI reply (500ms timeout)
@@ -343,6 +369,15 @@ async fn neopixel_task(ws2812: &'static mut NeoPixel) {
     let mut current_brightness = IDLE_BRIGHTNESS;
     let off = [RGB8 { r: 0, g: 0, b: 0 }];
     ws2812.write_slice(&off).await;
+
+    // Boot status indicator: flash green 5 times
+    let boot_green = RGB8 { r: 0, g: 32, b: 0 };
+    for _ in 0..5 {
+        ws2812.write_slice(&[boot_green]).await;
+        Timer::after(Duration::from_millis(150)).await;
+        ws2812.write_slice(&off).await;
+        Timer::after(Duration::from_millis(150)).await;
+    }
 
     loop {
         // Check for battery low warning first (highest priority)

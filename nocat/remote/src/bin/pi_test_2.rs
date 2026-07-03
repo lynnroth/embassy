@@ -146,6 +146,9 @@ static KEY_FLASH_SIGNAL: Signal<CriticalSectionRawMutex, u8> = Signal::new();
 /// Signal for battery low warning from sender
 static BATTERY_LOW_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+/// Signal for sender boot announcement
+static BOOT_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
 // ─── USB device task ────────────────────────────────────────────────
 #[embassy_executor::task]
 async fn usb_task(mut usb: MyUsbDevice) -> ! {
@@ -172,6 +175,13 @@ async fn radio_rx_task(stack: Stack<'static>) {
             if packet.data[0] == 0xFF && packet.data[1] == 0xFF {
                 log::warn!("Radio RX: battery low alert from sender");
                 BATTERY_LOW_SIGNAL.signal(());
+                continue;
+            }
+
+            // Check for boot marker [0xFE, 0xFE]
+            if packet.data[0] == 0xFE && packet.data[1] == 0xFE {
+                log::info!("Radio RX: sender boot announcement");
+                BOOT_SIGNAL.signal(());
                 continue;
             }
 
@@ -274,15 +284,36 @@ async fn neopixel_task(ws2812: &'static mut NeoPixel) {
 
     const IDLE_BRIGHTNESS: u8 = 4; // half of sender's 8 for battery saving
     let mut current_brightness = IDLE_BRIGHTNESS;
-    ws2812
-        .write_slice(&[RGB8 {
-            r: 0,
-            g: 0,
-            b: IDLE_BRIGHTNESS,
-        }])
-        .await;
+    let off = RGB8 { r: 0, g: 0, b: 0 };
+    ws2812.write_slice(&[off]).await;
+
+    // Boot status indicator: flash green 5 times
+    let boot_green = RGB8 { r: 0, g: 64, b: 0 };
+    for _ in 0..5 {
+        ws2812.write_slice(&[boot_green]).await;
+        Timer::after(Duration::from_millis(150)).await;
+        ws2812.write_slice(&[off]).await;
+        Timer::after(Duration::from_millis(150)).await;
+    }
+
+    // Turn on idle blue after boot flashes
+    ws2812.write_slice(&[RGB8 { r: 0, g: 0, b: IDLE_BRIGHTNESS }]).await;
 
     loop {
+        // Check for sender boot announcement (flash blue 5 times)
+        if BOOT_SIGNAL.try_take().is_some() {
+            let blue = RGB8 { r: 0, g: 0, b: 64 };
+            for _ in 0..5 {
+                ws2812.write_slice(&[blue]).await;
+                Timer::after(Duration::from_millis(150)).await;
+                ws2812.write_slice(&[off]).await;
+                Timer::after(Duration::from_millis(150)).await;
+            }
+            // Restore previous state
+            ws2812.write_slice(&[RGB8 { r: 0, g: 0, b: current_brightness }]).await;
+            continue;
+        }
+
         // Check for battery low warning first (highest priority)
         if BATTERY_LOW_SIGNAL.try_take().is_some() {
             log::warn!("NeoPixel: battery low warning, flashing red until cleared");
@@ -327,9 +358,9 @@ async fn neopixel_task(ws2812: &'static mut NeoPixel) {
             continue;
         }
 
-        // Wait for either an RSSI update or a key flash event
-        match select(RSSI_SIGNAL.wait(), KEY_FLASH_SIGNAL.wait()).await {
-            Either::First(rssi) => {
+        // Wait for an RSSI update, a key flash event, or a boot announcement
+        match select(select(RSSI_SIGNAL.wait(), KEY_FLASH_SIGNAL.wait()), BOOT_SIGNAL.wait()).await {
+            Either::First(Either::First(rssi)) => {
                 let brightness = rssi_to_brightness(rssi) / 2; // half brightness for battery
                 if brightness != current_brightness {
                     current_brightness = brightness;
@@ -343,7 +374,7 @@ async fn neopixel_task(ws2812: &'static mut NeoPixel) {
                         .await;
                 }
             }
-            Either::Second(key) => {
+            Either::First(Either::Second(key)) => {
                 // Flash red (key 0) or blue (key 1) for 200ms — half brightness
                 let color = match key {
                     0 => RGB8 { r: 128, g: 0, b: 0 },
@@ -359,6 +390,19 @@ async fn neopixel_task(ws2812: &'static mut NeoPixel) {
                         g: 0,
                         b: current_brightness,
                     }])
+                    .await;
+            }
+            Either::Second(_) => {
+                // Boot announcement from sender — flash blue 5 times
+                let blue = RGB8 { r: 0, g: 0, b: 64 };
+                for _ in 0..5 {
+                    ws2812.write_slice(&[blue]).await;
+                    Timer::after(Duration::from_millis(150)).await;
+                    ws2812.write_slice(&[off]).await;
+                    Timer::after(Duration::from_millis(150)).await;
+                }
+                ws2812
+                    .write_slice(&[RGB8 { r: 0, g: 0, b: current_brightness }])
                     .await;
             }
         }
